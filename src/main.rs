@@ -15,6 +15,9 @@ mod gh_app {
     use serde::{Deserialize, Serialize};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const DEFAULT_GH_APP_ID: &str = "2665041";
+    const DEFAULT_GH_APP_INSTALLATION_ID: &str = "104427264";
+
     #[derive(Debug, Serialize)]
     struct Claims {
         iat: u64,
@@ -35,9 +38,9 @@ mod gh_app {
     ///   - `GH_APP_PRIVATE_KEY` — PEM contents, OR
     ///   - `GH_APP_PRIVATE_KEY_FILE` — path to PEM file
     pub fn get_installation_token() -> Result<String> {
-        let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| "2665041".to_string());
-        let installation_id =
-            std::env::var("GH_APP_INSTALLATION_ID").unwrap_or_else(|_| "104427264".to_string());
+        let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| DEFAULT_GH_APP_ID.to_string());
+        let installation_id = std::env::var("GH_APP_INSTALLATION_ID")
+            .unwrap_or_else(|_| DEFAULT_GH_APP_INSTALLATION_ID.to_string());
 
         let pem = if let Ok(key) = std::env::var("GH_APP_PRIVATE_KEY") {
             key
@@ -364,6 +367,8 @@ fn delete_remote_branch(
 
 /// List repos in an org
 fn list_org_repos(token: &Option<String>, org: &str) -> Result<Vec<String>> {
+    const REPO_LIST_LIMIT: &str = "200";
+
     let output = gh_command(token)
         .args([
             "repo",
@@ -375,7 +380,7 @@ fn list_org_repos(token: &Option<String>, org: &str) -> Result<Vec<String>> {
             "--jq",
             ".[].name",
             "--limit",
-            "200",
+            REPO_LIST_LIMIT,
         ])
         .output()
         .context("Failed to list org repos")?;
