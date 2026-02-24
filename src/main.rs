@@ -36,8 +36,8 @@ mod gh_app {
     ///   - `GH_APP_PRIVATE_KEY_FILE` — path to PEM file
     pub fn get_installation_token() -> Result<String> {
         let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| "2665041".to_string());
-        let installation_id = std::env::var("GH_APP_INSTALLATION_ID")
-            .unwrap_or_else(|_| "104427264".to_string());
+        let installation_id =
+            std::env::var("GH_APP_INSTALLATION_ID").unwrap_or_else(|_| "104427264".to_string());
 
         let pem = if let Ok(key) = std::env::var("GH_APP_PRIVATE_KEY") {
             key
@@ -122,7 +122,11 @@ fn gh_command(token: &Option<String>) -> Command {
 // --- CLI ---
 
 #[derive(Parser, Debug)]
-#[command(name = "ai-agent-cleaner", version, about = "AI agent for repository hygiene: sensitive file scanning and branch pruning")]
+#[command(
+    name = "ai-agent-cleaner",
+    version,
+    about = "AI agent for repository hygiene: sensitive file scanning and branch pruning"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -311,11 +315,16 @@ fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Resu
 fn list_open_pr_branches(token: &Option<String>, owner: &str, repo: &str) -> Result<Vec<String>> {
     let output = gh_command(token)
         .args([
-            "pr", "list",
-            "--repo", &format!("{}/{}", owner, repo),
-            "--state", "open",
-            "--json", "headRefName",
-            "--jq", ".[].headRefName",
+            "pr",
+            "list",
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--state",
+            "open",
+            "--json",
+            "headRefName",
+            "--jq",
+            ".[].headRefName",
         ])
         .output()
         .context("Failed to list open PRs")?;
@@ -334,7 +343,12 @@ fn list_open_pr_branches(token: &Option<String>, owner: &str, repo: &str) -> Res
 }
 
 /// Delete a remote branch
-fn delete_remote_branch(token: &Option<String>, owner: &str, repo: &str, branch: &str) -> Result<()> {
+fn delete_remote_branch(
+    token: &Option<String>,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<()> {
     let endpoint = format!("repos/{}/{}/git/refs/heads/{}", owner, repo, branch);
     let output = gh_command(token)
         .args(["api", "-X", "DELETE", &endpoint])
@@ -352,11 +366,16 @@ fn delete_remote_branch(token: &Option<String>, owner: &str, repo: &str, branch:
 fn list_org_repos(token: &Option<String>, org: &str) -> Result<Vec<String>> {
     let output = gh_command(token)
         .args([
-            "repo", "list", org,
+            "repo",
+            "list",
+            org,
             "--no-archived",
-            "--json", "name",
-            "--jq", ".[].name",
-            "--limit", "200",
+            "--json",
+            "name",
+            "--jq",
+            ".[].name",
+            "--limit",
+            "200",
         ])
         .output()
         .context("Failed to list org repos")?;
