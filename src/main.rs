@@ -103,7 +103,10 @@ fn resolve_gh_token() -> Option<String> {
             eprintln!("Using GitHub App installation token");
             Some(token)
         }
-        Err(_) => None,
+        Err(e) => {
+            eprintln!("GitHub App auth not available: {}", e);
+            None
+        }
     }
 }
 
