@@ -421,6 +421,28 @@ fn list_org_repos(token: &Option<String>, org: &str, include_forks: bool) -> Res
     Ok(repos)
 }
 
+/// Get the default branch for a repo (e.g. "main", "master").
+/// Auto-protected to avoid HTTP 422 errors when attempting to delete it.
+fn get_default_branch(token: &Option<String>, owner: &str, repo: &str) -> Result<String> {
+    let endpoint = format!("repos/{}/{}", owner, repo);
+    let output = gh_command(token)
+        .args(["api", &endpoint, "--jq", ".default_branch"])
+        .output()
+        .context("Failed to get default branch")?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to get default branch for {}/{}: {}",
+            owner,
+            repo,
+            err
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn prune_repo(
     token: &Option<String>,
     owner: &str,
@@ -434,8 +456,14 @@ fn prune_repo(
     let branches = list_remote_branches(token, owner, repo)?;
     let open_pr_branches = list_open_pr_branches(token, owner, repo)?;
 
-    let protected_set: std::collections::HashSet<&str> =
+    // Auto-protect the default branch to avoid HTTP 422 errors
+    let default_branch = get_default_branch(token, owner, repo).unwrap_or_default();
+
+    let mut protected_set: std::collections::HashSet<&str> =
         protected.iter().map(|s| s.as_str()).collect();
+    if !default_branch.is_empty() {
+        protected_set.insert(&default_branch);
+    }
     let pr_set: std::collections::HashSet<&str> =
         open_pr_branches.iter().map(|s| s.as_str()).collect();
 
@@ -730,5 +758,96 @@ mod tests {
             .iter()
             .any(|r| r == "llama.cpp" || r == "gitoxide");
         assert!(has_fork, "Expected at least one fork in all_repos list");
+    }
+
+    // --- Tests for default branch auto-protection ---
+
+    #[test]
+    fn test_default_branch_added_to_protected_set() {
+        // Simulate what prune_repo does: merge user-provided protected + default branch
+        let protected = vec!["main".to_string(), "develop".to_string()];
+        let default_branch = "master".to_string(); // repo's default is master
+
+        let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
+        if !default_branch.is_empty() {
+            protected_set.insert(&default_branch);
+        }
+
+        assert!(protected_set.contains("main"));
+        assert!(protected_set.contains("develop"));
+        assert!(protected_set.contains("master"));
+    }
+
+    #[test]
+    fn test_default_branch_no_duplicate_when_already_protected() {
+        let protected = vec!["main".to_string(), "develop".to_string()];
+        let default_branch = "main".to_string(); // already in protected list
+
+        let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
+        if !default_branch.is_empty() {
+            protected_set.insert(&default_branch);
+        }
+
+        // Should still be 2 entries, not 3
+        assert_eq!(protected_set.len(), 2);
+        assert!(protected_set.contains("main"));
+    }
+
+    #[test]
+    fn test_empty_default_branch_does_not_add_to_protected() {
+        let protected = vec!["main".to_string()];
+        let default_branch = String::new();
+
+        let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
+        if !default_branch.is_empty() {
+            protected_set.insert(&default_branch);
+        }
+
+        assert_eq!(protected_set.len(), 1);
+    }
+
+    #[test]
+    fn test_default_branch_prevents_deletion() {
+        // The default branch should appear in the protected list, not the delete list
+        let branches = vec!["master", "feat/old", "bugfix/stale"];
+        let protected = vec!["main", "develop"];
+        let default_branch = "master";
+
+        let mut protected_set: HashSet<&str> = protected.iter().copied().collect();
+        protected_set.insert(default_branch);
+
+        let (deleted, _kept_protected, _) = classify_branches(&branches, &[], &[]);
+        // Without default branch protection, master would be deleted
+        assert!(deleted.contains(&"master".to_string()));
+
+        // With default branch in protected set, re-classify
+        let protected_vec: Vec<&str> = protected_set.iter().copied().collect();
+        let (deleted2, kept2, _) = classify_branches(&branches, &protected_vec, &[]);
+        assert!(!deleted2.contains(&"master".to_string()));
+        assert!(kept2.contains(&"master".to_string()));
+    }
+
+    #[test]
+    fn test_get_default_branch_integration() {
+        if std::env::var("GH_TOKEN").is_err() && std::env::var("GH_APP_PRIVATE_KEY_FILE").is_err() {
+            eprintln!("Skipping integration test: no GitHub auth available");
+            return;
+        }
+
+        let token = resolve_gh_token();
+
+        // lornu-ai-cleaner's default branch should be "develop" or "main"
+        let default = get_default_branch(&token, "lornu-ai", "lornu-ai-cleaner")
+            .expect("Failed to get default branch");
+        assert!(
+            default == "main" || default == "develop",
+            "Expected default branch to be main or develop, got: {}",
+            default
+        );
+
+        // crossplane-heaven's default is "master"
+        let default2 = get_default_branch(&token, "stevedores-org", "crossplane-heaven")
+            .expect("Failed to get default branch");
+        assert_eq!(default2, "master");
     }
 }
