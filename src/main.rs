@@ -36,8 +36,8 @@ mod gh_app {
     ///   - `GH_APP_PRIVATE_KEY_FILE` — path to PEM file
     pub fn get_installation_token() -> Result<String> {
         let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| "2665041".to_string());
-        let installation_id = std::env::var("GH_APP_INSTALLATION_ID")
-            .unwrap_or_else(|_| "104427264".to_string());
+        let installation_id =
+            std::env::var("GH_APP_INSTALLATION_ID").unwrap_or_else(|_| "104427264".to_string());
 
         let pem = if let Ok(key) = std::env::var("GH_APP_PRIVATE_KEY") {
             key
@@ -122,7 +122,11 @@ fn gh_command(token: &Option<String>) -> Command {
 // --- CLI ---
 
 #[derive(Parser, Debug)]
-#[command(name = "ai-agent-cleaner", version, about = "AI agent for repository hygiene: sensitive file scanning and branch pruning")]
+#[command(
+    name = "ai-agent-cleaner",
+    version,
+    about = "AI agent for repository hygiene: sensitive file scanning and branch pruning"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -166,6 +170,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Include forked repos (by default forks are skipped)
+        #[arg(long)]
+        include_forks: bool,
     },
 }
 
@@ -311,11 +319,16 @@ fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Resu
 fn list_open_pr_branches(token: &Option<String>, owner: &str, repo: &str) -> Result<Vec<String>> {
     let output = gh_command(token)
         .args([
-            "pr", "list",
-            "--repo", &format!("{}/{}", owner, repo),
-            "--state", "open",
-            "--json", "headRefName",
-            "--jq", ".[].headRefName",
+            "pr",
+            "list",
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--state",
+            "open",
+            "--json",
+            "headRefName",
+            "--jq",
+            ".[].headRefName",
         ])
         .output()
         .context("Failed to list open PRs")?;
@@ -334,7 +347,12 @@ fn list_open_pr_branches(token: &Option<String>, owner: &str, repo: &str) -> Res
 }
 
 /// Delete a remote branch
-fn delete_remote_branch(token: &Option<String>, owner: &str, repo: &str, branch: &str) -> Result<()> {
+fn delete_remote_branch(
+    token: &Option<String>,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<()> {
     let endpoint = format!("repos/{}/{}/git/refs/heads/{}", owner, repo, branch);
     let output = gh_command(token)
         .args(["api", "-X", "DELETE", &endpoint])
@@ -348,30 +366,59 @@ fn delete_remote_branch(token: &Option<String>, owner: &str, repo: &str, branch:
     Ok(())
 }
 
-/// List repos in an org
-fn list_org_repos(token: &Option<String>, org: &str) -> Result<Vec<String>> {
-    let output = gh_command(token)
-        .args([
-            "repo", "list", org,
-            "--no-archived",
-            "--json", "name",
-            "--jq", ".[].name",
-            "--limit", "200",
-        ])
-        .output()
-        .context("Failed to list org repos")?;
+/// List repos in an org, optionally excluding forks.
+///
+/// Uses the GitHub REST API with `type=sources` to exclude forks when
+/// `include_forks` is false. This prevents accidentally deleting upstream
+/// branches in forked repositories (e.g. llama.cpp with 543 branches).
+fn list_org_repos(token: &Option<String>, org: &str, include_forks: bool) -> Result<Vec<String>> {
+    let mut repos = Vec::new();
+    let mut page = 1;
+    let repo_type = if include_forks { "all" } else { "sources" };
 
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("gh repo list failed: {}", err);
+    loop {
+        let endpoint = format!(
+            "orgs/{}/repos?per_page=100&page={}&type={}&sort=name",
+            org, page, repo_type
+        );
+        let output = gh_command(token)
+            .args([
+                "api",
+                &endpoint,
+                "--jq",
+                ".[] | select(.archived == false) | .name",
+            ])
+            .output()
+            .context("Failed to list org repos")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh repo list failed for {}: {}", org, err);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let page_repos: Vec<String> = stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+
+        if page_repos.is_empty() {
+            break;
+        }
+        repos.extend(page_repos);
+        page += 1;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect())
+    if !include_forks {
+        eprintln!(
+            "Found {} source repos in {} (forks excluded)",
+            repos.len(),
+            org
+        );
+    }
+
+    Ok(repos)
 }
 
 fn prune_repo(
@@ -438,13 +485,14 @@ fn cmd_prune(
     protected: Vec<String>,
     dry_run: bool,
     json_output: bool,
+    include_forks: bool,
 ) -> Result<()> {
     let token = resolve_gh_token();
 
     let repos = if let Some(r) = repo {
         vec![r]
     } else {
-        list_org_repos(&token, &org)?
+        list_org_repos(&token, &org, include_forks)?
     };
 
     if dry_run {
@@ -517,6 +565,170 @@ fn main() -> Result<()> {
             protected,
             dry_run,
             json,
-        } => cmd_prune(org, repo, protected, dry_run, json),
+            include_forks,
+        } => cmd_prune(org, repo, protected, dry_run, json, include_forks),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // --- Unit tests for branch classification logic ---
+
+    fn classify_branches(
+        branches: &[&str],
+        protected: &[&str],
+        open_pr_branches: &[&str],
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let protected_set: HashSet<&str> = protected.iter().copied().collect();
+        let pr_set: HashSet<&str> = open_pr_branches.iter().copied().collect();
+
+        let mut to_delete = Vec::new();
+        let mut kept_protected = Vec::new();
+        let mut kept_pr = Vec::new();
+
+        for &branch in branches {
+            if protected_set.contains(branch) {
+                kept_protected.push(branch.to_string());
+            } else if pr_set.contains(branch) {
+                kept_pr.push(branch.to_string());
+            } else {
+                to_delete.push(branch.to_string());
+            }
+        }
+
+        (to_delete, kept_protected, kept_pr)
+    }
+
+    #[test]
+    fn test_protected_branches_are_never_deleted() {
+        let branches = vec!["main", "develop", "master", "feat/foo"];
+        let protected = vec!["main", "develop", "master"];
+        let (deleted, kept, _) = classify_branches(&branches, &protected, &[]);
+
+        assert_eq!(deleted, vec!["feat/foo"]);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.contains(&"main".to_string()));
+        assert!(kept.contains(&"develop".to_string()));
+        assert!(kept.contains(&"master".to_string()));
+    }
+
+    #[test]
+    fn test_open_pr_branches_are_kept() {
+        let branches = vec!["main", "feat/active-pr", "stale/old"];
+        let protected = vec!["main"];
+        let open_prs = vec!["feat/active-pr"];
+        let (deleted, _, kept_pr) = classify_branches(&branches, &protected, &open_prs);
+
+        assert_eq!(deleted, vec!["stale/old"]);
+        assert_eq!(kept_pr, vec!["feat/active-pr"]);
+    }
+
+    #[test]
+    fn test_no_branches_deleted_when_all_protected_or_pr() {
+        let branches = vec!["main", "develop", "feat/pr-open"];
+        let protected = vec!["main", "develop"];
+        let open_prs = vec!["feat/pr-open"];
+        let (deleted, _, _) = classify_branches(&branches, &protected, &open_prs);
+
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn test_all_stale_branches_deleted() {
+        let branches = vec!["main", "stale/a", "stale/b", "stale/c"];
+        let protected = vec!["main"];
+        let (deleted, _, _) = classify_branches(&branches, &protected, &[]);
+
+        assert_eq!(deleted, vec!["stale/a", "stale/b", "stale/c"]);
+    }
+
+    #[test]
+    fn test_empty_branch_list() {
+        let (deleted, kept, kept_pr) = classify_branches(&[], &["main"], &[]);
+        assert!(deleted.is_empty());
+        assert!(kept.is_empty());
+        assert!(kept_pr.is_empty());
+    }
+
+    // --- Tests for fork filtering (API endpoint construction) ---
+
+    #[test]
+    fn test_api_endpoint_excludes_forks_by_default() {
+        let include_forks = false;
+        let repo_type = if include_forks { "all" } else { "sources" };
+        let endpoint = format!(
+            "orgs/{}/repos?per_page=100&page=1&type={}&sort=name",
+            "test-org", repo_type
+        );
+
+        assert!(endpoint.contains("type=sources"));
+        assert!(!endpoint.contains("type=all"));
+    }
+
+    #[test]
+    fn test_api_endpoint_includes_forks_when_flag_set() {
+        let include_forks = true;
+        let repo_type = if include_forks { "all" } else { "sources" };
+        let endpoint = format!(
+            "orgs/{}/repos?per_page=100&page=1&type={}&sort=name",
+            "test-org", repo_type
+        );
+
+        assert!(endpoint.contains("type=all"));
+        assert!(!endpoint.contains("type=sources"));
+    }
+
+    // --- Integration tests (require GH_TOKEN or GH_APP_PRIVATE_KEY_FILE) ---
+
+    #[test]
+    fn test_list_org_repos_skips_forks_integration() {
+        if std::env::var("GH_TOKEN").is_err() && std::env::var("GH_APP_PRIVATE_KEY_FILE").is_err() {
+            eprintln!("Skipping integration test: no GitHub auth available");
+            return;
+        }
+
+        let token = resolve_gh_token();
+
+        let source_repos =
+            list_org_repos(&token, "stevedores-org", false).expect("Failed to list source repos");
+        let all_repos =
+            list_org_repos(&token, "stevedores-org", true).expect("Failed to list all repos");
+
+        // stevedores-org has known forks (llama.cpp, gitoxide, libgit2, mlx)
+        assert!(
+            all_repos.len() > source_repos.len(),
+            "Expected all_repos ({}) > source_repos ({}) due to forks",
+            all_repos.len(),
+            source_repos.len()
+        );
+
+        let known_forks = ["llama.cpp", "gitoxide", "libgit2", "mlx"];
+        for fork in &known_forks {
+            assert!(
+                !source_repos.contains(&fork.to_string()),
+                "Fork '{}' should be excluded from source repos",
+                fork
+            );
+        }
+    }
+
+    #[test]
+    fn test_include_forks_flag_returns_forks_integration() {
+        if std::env::var("GH_TOKEN").is_err() && std::env::var("GH_APP_PRIVATE_KEY_FILE").is_err() {
+            eprintln!("Skipping integration test: no GitHub auth available");
+            return;
+        }
+
+        let token = resolve_gh_token();
+        let all_repos =
+            list_org_repos(&token, "stevedores-org", true).expect("Failed to list all repos");
+
+        let has_fork = all_repos
+            .iter()
+            .any(|r| r == "llama.cpp" || r == "gitoxide");
+        assert!(has_fork, "Expected at least one fork in all_repos list");
     }
 }
