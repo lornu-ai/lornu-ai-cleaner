@@ -7,6 +7,117 @@ use std::path::PathBuf;
 use std::process::Command;
 use walkdir::WalkDir;
 
+// --- GitHub App Auth ---
+
+mod gh_app {
+    use anyhow::{Context, Result};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::{Deserialize, Serialize};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Serialize)]
+    struct Claims {
+        iat: u64,
+        exp: u64,
+        iss: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct InstallationToken {
+        token: String,
+    }
+
+    /// Generate a GitHub App installation token.
+    ///
+    /// Reads config from environment variables:
+    ///   - `GH_APP_ID` (or uses default 2665041)
+    ///   - `GH_APP_INSTALLATION_ID` (or uses default 104427264)
+    ///   - `GH_APP_PRIVATE_KEY` — PEM contents, OR
+    ///   - `GH_APP_PRIVATE_KEY_FILE` — path to PEM file
+    pub fn get_installation_token() -> Result<String> {
+        let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| "2665041".to_string());
+        let installation_id = std::env::var("GH_APP_INSTALLATION_ID")
+            .unwrap_or_else(|_| "104427264".to_string());
+
+        let pem = if let Ok(key) = std::env::var("GH_APP_PRIVATE_KEY") {
+            key
+        } else if let Ok(path) = std::env::var("GH_APP_PRIVATE_KEY_FILE") {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read private key from {}", path))?
+        } else {
+            anyhow::bail!(
+                "GitHub App auth requires GH_APP_PRIVATE_KEY (PEM contents) or \
+                 GH_APP_PRIVATE_KEY_FILE (path to PEM file)"
+            );
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System time error")?
+            .as_secs();
+
+        let claims = Claims {
+            iat: now.saturating_sub(60),
+            exp: now + (10 * 60), // 10 minutes
+            iss: app_id,
+        };
+
+        let header = Header::new(Algorithm::RS256);
+        let key =
+            EncodingKey::from_rsa_pem(pem.as_bytes()).context("Invalid RSA private key PEM")?;
+        let jwt = encode(&header, &claims, &key).context("Failed to encode JWT")?;
+
+        let url = format!(
+            "https://api.github.com/app/installations/{}/access_tokens",
+            installation_id
+        );
+
+        let resp: InstallationToken = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", jwt))
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "ai-agent-cleaner")
+            .call()
+            .context("Failed to request installation token")?
+            .into_json()
+            .context("Failed to parse installation token response")?;
+
+        Ok(resp.token)
+    }
+}
+
+/// Resolve a GitHub token for `gh` CLI authentication.
+///
+/// Priority:
+///   1. `GH_TOKEN` env var (already set by user or CI)
+///   2. GitHub App credentials (GH_APP_PRIVATE_KEY / GH_APP_PRIVATE_KEY_FILE)
+///   3. None — fall back to whatever `gh auth` provides
+fn resolve_gh_token() -> Option<String> {
+    if let Ok(token) = std::env::var("GH_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    match gh_app::get_installation_token() {
+        Ok(token) => {
+            eprintln!("Using GitHub App installation token");
+            Some(token)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Create a `Command` for `gh` with the resolved token injected.
+fn gh_command(token: &Option<String>) -> Command {
+    let mut cmd = Command::new("gh");
+    if let Some(t) = token {
+        cmd.env("GH_TOKEN", t);
+    }
+    cmd
+}
+
+// --- CLI ---
+
 #[derive(Parser, Debug)]
 #[command(name = "ai-agent-cleaner", version, about = "AI agent for repository hygiene: sensitive file scanning and branch pruning")]
 struct Cli {
@@ -157,7 +268,7 @@ struct PruneResult {
 }
 
 /// List remote branches for a repo using `gh api`
-fn list_remote_branches(owner: &str, repo: &str) -> Result<Vec<String>> {
+fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Result<Vec<String>> {
     let mut branches = Vec::new();
     let mut page = 1;
 
@@ -166,7 +277,7 @@ fn list_remote_branches(owner: &str, repo: &str) -> Result<Vec<String>> {
             "repos/{}/{}/branches?per_page=100&page={}",
             owner, repo, page
         );
-        let output = Command::new("gh")
+        let output = gh_command(token)
             .args(["api", &endpoint, "--jq", ".[].name"])
             .output()
             .context("Failed to run gh api")?;
@@ -194,8 +305,8 @@ fn list_remote_branches(owner: &str, repo: &str) -> Result<Vec<String>> {
 }
 
 /// List branches with open PRs for a repo
-fn list_open_pr_branches(owner: &str, repo: &str) -> Result<Vec<String>> {
-    let output = Command::new("gh")
+fn list_open_pr_branches(token: &Option<String>, owner: &str, repo: &str) -> Result<Vec<String>> {
+    let output = gh_command(token)
         .args([
             "pr", "list",
             "--repo", &format!("{}/{}", owner, repo),
@@ -220,9 +331,9 @@ fn list_open_pr_branches(owner: &str, repo: &str) -> Result<Vec<String>> {
 }
 
 /// Delete a remote branch
-fn delete_remote_branch(owner: &str, repo: &str, branch: &str) -> Result<()> {
+fn delete_remote_branch(token: &Option<String>, owner: &str, repo: &str, branch: &str) -> Result<()> {
     let endpoint = format!("repos/{}/{}/git/refs/heads/{}", owner, repo, branch);
-    let output = Command::new("gh")
+    let output = gh_command(token)
         .args(["api", "-X", "DELETE", &endpoint])
         .output()
         .context("Failed to delete branch")?;
@@ -235,8 +346,8 @@ fn delete_remote_branch(owner: &str, repo: &str, branch: &str) -> Result<()> {
 }
 
 /// List repos in an org
-fn list_org_repos(org: &str) -> Result<Vec<String>> {
-    let output = Command::new("gh")
+fn list_org_repos(token: &Option<String>, org: &str) -> Result<Vec<String>> {
+    let output = gh_command(token)
         .args([
             "repo", "list", org,
             "--no-archived",
@@ -261,6 +372,7 @@ fn list_org_repos(org: &str) -> Result<Vec<String>> {
 }
 
 fn prune_repo(
+    token: &Option<String>,
     owner: &str,
     repo: &str,
     protected: &[String],
@@ -269,8 +381,8 @@ fn prune_repo(
     let full_name = format!("{}/{}", owner, repo);
     eprintln!("Scanning {}...", full_name);
 
-    let branches = list_remote_branches(owner, repo)?;
-    let open_pr_branches = list_open_pr_branches(owner, repo)?;
+    let branches = list_remote_branches(token, owner, repo)?;
+    let open_pr_branches = list_open_pr_branches(token, owner, repo)?;
 
     let protected_set: std::collections::HashSet<&str> =
         protected.iter().map(|s| s.as_str()).collect();
@@ -301,7 +413,7 @@ fn prune_repo(
             result.branches_deleted.push(branch.clone());
             eprintln!("  [dry-run] would delete: {}", branch);
         } else {
-            match delete_remote_branch(owner, repo, branch) {
+            match delete_remote_branch(token, owner, repo, branch) {
                 Ok(()) => {
                     result.branches_deleted.push(branch.clone());
                     eprintln!("  deleted: {}", branch);
@@ -324,10 +436,12 @@ fn cmd_prune(
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
+    let token = resolve_gh_token();
+
     let repos = if let Some(r) = repo {
         vec![r]
     } else {
-        list_org_repos(&org)?
+        list_org_repos(&token, &org)?
     };
 
     if dry_run {
@@ -337,7 +451,7 @@ fn cmd_prune(
     let mut all_results = Vec::new();
 
     for repo_name in &repos {
-        match prune_repo(&org, repo_name, &protected, dry_run) {
+        match prune_repo(&token, &org, repo_name, &protected, dry_run) {
             Ok(result) => {
                 if !json_output {
                     let action = if dry_run { "would delete" } else { "deleted" };
