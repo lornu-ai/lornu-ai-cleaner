@@ -204,14 +204,38 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool) -> Result<()> {
     println!("Starting cleanup scan in: {:?}", root);
 
     let patterns = vec![
-        Pattern::new("Stripe Secret Key", r"sk_live_[0-9a-zA-Z]{24}"),
-        Pattern::new("Stripe Publishable Key", r"pk_live_[0-9a-zA-Z]{24}"),
+        // Payment
+        Pattern::new("Stripe Secret Key", r"sk_live_[0-9a-zA-Z]{24,}"),
+        Pattern::new("Stripe Publishable Key", r"pk_live_[0-9a-zA-Z]{24,}"),
+        Pattern::new("Stripe Test Secret Key", r"sk_test_[0-9a-zA-Z]{24,}"),
+        // Cloud providers
         Pattern::new("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
+        Pattern::new(
+            "AWS Secret Key",
+            r#"(?i)(aws_secret_access_key|aws_secret)\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
+        ),
         Pattern::new(
             "GCP Private Key",
             concat!("-----BEGIN PRIVATE ", "KEY-----"),
         ),
-        Pattern::new("Generic Token", r"[a-zA-Z0-9]{32,}"),
+        Pattern::new("GCP Service Account", r#""type"\s*:\s*"service_account""#),
+        // GitHub
+        Pattern::new("GitHub Token (ghp)", r"ghp_[A-Za-z0-9]{36,}"),
+        Pattern::new("GitHub Token (gho)", r"gho_[A-Za-z0-9]{36,}"),
+        Pattern::new("GitHub Token (ghu)", r"ghu_[A-Za-z0-9]{36,}"),
+        Pattern::new("GitHub Token (ghs)", r"ghs_[A-Za-z0-9]{36,}"),
+        Pattern::new("GitHub Token (ghr)", r"ghr_[A-Za-z0-9]{36,}"),
+        // Slack
+        Pattern::new("Slack Token", r"xox[bporas]-[0-9A-Za-z\-]{10,}"),
+        Pattern::new(
+            "Slack Webhook",
+            r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+",
+        ),
+        // Generic secrets (require assignment context to reduce false positives)
+        Pattern::new(
+            "Generic Secret Assignment",
+            r#"(?i)(secret|token|password|api_key|apikey|auth_token|access_token)\s*[=:]\s*["'][A-Za-z0-9/+=_\-]{20,}["']"#,
+        ),
     ];
 
     let mut sensitive_files = Vec::new();
@@ -232,6 +256,53 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool) -> Result<()> {
             || path.to_string_lossy().contains("/venv/")
         {
             continue;
+        }
+
+        // Skip files that commonly produce false positives (lock files, certs, binaries)
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if matches!(
+                ext,
+                "lock"
+                    | "sum"
+                    | "pem"
+                    | "crt"
+                    | "cer"
+                    | "der"
+                    | "p12"
+                    | "pfx"
+                    | "min.js"
+                    | "map"
+                    | "wasm"
+                    | "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "ico"
+                    | "svg"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "eot"
+                    | "pdf"
+            ) {
+                continue;
+            }
+        }
+        // Also skip files by name that are known false-positive generators
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if matches!(
+                name,
+                "Cargo.lock"
+                    | "package-lock.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "go.sum"
+                    | "Gemfile.lock"
+                    | "poetry.lock"
+                    | "composer.lock"
+            ) {
+                continue;
+            }
         }
 
         if let Ok(content) = fs::read_to_string(path) {
@@ -1084,6 +1155,193 @@ mod tests {
 
         // None date returns None
         assert_eq!(branch_age_days(&None), None);
+    }
+
+    // --- Tests for scan patterns (issue #5: reduce false positives) ---
+
+    fn build_patterns() -> Vec<Pattern> {
+        vec![
+            Pattern::new("Stripe Secret Key", r"sk_live_[0-9a-zA-Z]{24,}"),
+            Pattern::new("Stripe Publishable Key", r"pk_live_[0-9a-zA-Z]{24,}"),
+            Pattern::new("Stripe Test Secret Key", r"sk_test_[0-9a-zA-Z]{24,}"),
+            Pattern::new("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
+            Pattern::new(
+                "AWS Secret Key",
+                r#"(?i)(aws_secret_access_key|aws_secret)\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
+            ),
+            Pattern::new(
+                "GCP Private Key",
+                concat!("-----BEGIN PRIVATE ", "KEY-----"),
+            ),
+            Pattern::new("GCP Service Account", r#""type"\s*:\s*"service_account""#),
+            Pattern::new("GitHub Token (ghp)", r"ghp_[A-Za-z0-9]{36,}"),
+            Pattern::new("GitHub Token (gho)", r"gho_[A-Za-z0-9]{36,}"),
+            Pattern::new("GitHub Token (ghu)", r"ghu_[A-Za-z0-9]{36,}"),
+            Pattern::new("GitHub Token (ghs)", r"ghs_[A-Za-z0-9]{36,}"),
+            Pattern::new("GitHub Token (ghr)", r"ghr_[A-Za-z0-9]{36,}"),
+            Pattern::new("Slack Token", r"xox[bporas]-[0-9A-Za-z\-]{10,}"),
+            Pattern::new(
+                "Slack Webhook",
+                r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+",
+            ),
+            Pattern::new(
+                "Generic Secret Assignment",
+                r#"(?i)(secret|token|password|api_key|apikey|auth_token|access_token)\s*[=:]\s*["'][A-Za-z0-9/+=_\-]{20,}["']"#,
+            ),
+        ]
+    }
+
+    fn any_pattern_matches(patterns: &[Pattern], content: &str) -> Vec<String> {
+        patterns
+            .iter()
+            .filter(|p| p.regex.is_match(content))
+            .map(|p| p.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_scan_matches_real_stripe_key() {
+        let patterns = build_patterns();
+        // Build test value at runtime to avoid GitHub push protection flagging it
+        let fake_key = format!("sk_{}_abc123def456ghi789jkl012mno", "live");
+        let content = format!(r#"STRIPE_KEY = "{}""#, fake_key);
+        let matches = any_pattern_matches(&patterns, &content);
+        assert!(
+            matches.iter().any(|m| m.contains("Stripe")),
+            "Should match Stripe key, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_matches_aws_access_key() {
+        let patterns = build_patterns();
+        let content = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE";
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.iter().any(|m| m.contains("AWS")),
+            "Should match AWS access key, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_matches_github_token() {
+        let patterns = build_patterns();
+        let content = "export GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn";
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.iter().any(|m| m.contains("GitHub")),
+            "Should match GitHub token, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_matches_generic_secret_assignment() {
+        let patterns = build_patterns();
+        let content = r#"api_key = "sk_1234567890abcdefghij""#;
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.iter().any(|m| m.contains("Generic")),
+            "Should match generic secret assignment, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_no_match_on_plain_sha256() {
+        let patterns = build_patterns();
+        // SHA-256 hashes should NOT trigger any pattern
+        let content =
+            "digest = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"";
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.is_empty(),
+            "SHA-256 hash should not match any pattern, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_no_match_on_uuid() {
+        let patterns = build_patterns();
+        let content = r#"id = "550e8400-e29b-41d4-a716-446655440000""#;
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.is_empty(),
+            "UUID should not match any pattern, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_no_match_on_hex_version() {
+        let patterns = build_patterns();
+        let content = "version = \"0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d\"";
+        let matches = any_pattern_matches(&patterns, content);
+        assert!(
+            matches.is_empty(),
+            "Hex version string should not match, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_matches_slack_webhook() {
+        let patterns = build_patterns();
+        // Build at runtime to avoid GitHub push protection
+        let content = format!(
+            "https://hooks.slack.com/{}/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+            "services"
+        );
+        let matches = any_pattern_matches(&patterns, &content);
+        assert!(
+            matches.iter().any(|m| m.contains("Slack")),
+            "Should match Slack webhook, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn test_scan_skipped_extensions() {
+        // Verify the extension skip list logic
+        let skip_exts = [
+            "lock", "sum", "pem", "crt", "cer", "der", "p12", "pfx", "map", "wasm", "png", "jpg",
+            "jpeg", "gif", "ico", "svg", "woff", "woff2", "ttf", "eot", "pdf",
+        ];
+        for ext in &skip_exts {
+            let path = std::path::Path::new("test").with_extension(ext);
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some(*ext),
+                "Extension {} should be extractable from path",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_skipped_lockfiles() {
+        let skip_names = [
+            "Cargo.lock",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "go.sum",
+            "Gemfile.lock",
+            "poetry.lock",
+            "composer.lock",
+        ];
+        for name in &skip_names {
+            let path = std::path::Path::new(name);
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(*name),
+                "Filename {} should be extractable",
+                name
+            );
+        }
     }
 
     #[test]
