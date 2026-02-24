@@ -15,6 +15,9 @@ mod gh_app {
     use serde::{Deserialize, Serialize};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const DEFAULT_GH_APP_ID: &str = "2665041";
+    const DEFAULT_GH_APP_INSTALLATION_ID: &str = "104427264";
+
     #[derive(Debug, Serialize)]
     struct Claims {
         iat: u64,
@@ -35,9 +38,9 @@ mod gh_app {
     ///   - `GH_APP_PRIVATE_KEY` — PEM contents, OR
     ///   - `GH_APP_PRIVATE_KEY_FILE` — path to PEM file
     pub fn get_installation_token() -> Result<String> {
-        let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| "2665041".to_string());
-        let installation_id =
-            std::env::var("GH_APP_INSTALLATION_ID").unwrap_or_else(|_| "104427264".to_string());
+        let app_id = std::env::var("GH_APP_ID").unwrap_or_else(|_| DEFAULT_GH_APP_ID.to_string());
+        let installation_id = std::env::var("GH_APP_INSTALLATION_ID")
+            .unwrap_or_else(|_| DEFAULT_GH_APP_INSTALLATION_ID.to_string());
 
         let pem = if let Ok(key) = std::env::var("GH_APP_PRIVATE_KEY") {
             key
@@ -372,14 +375,16 @@ fn delete_remote_branch(
 /// `include_forks` is false. This prevents accidentally deleting upstream
 /// branches in forked repositories (e.g. llama.cpp with 543 branches).
 fn list_org_repos(token: &Option<String>, org: &str, include_forks: bool) -> Result<Vec<String>> {
+    const ORG_REPOS_PER_PAGE: u32 = 100;
+
     let mut repos = Vec::new();
     let mut page = 1;
     let repo_type = if include_forks { "all" } else { "sources" };
 
     loop {
         let endpoint = format!(
-            "orgs/{}/repos?per_page=100&page={}&type={}&sort=name",
-            org, page, repo_type
+            "orgs/{}/repos?per_page={}&page={}&type={}&sort=name",
+            org, ORG_REPOS_PER_PAGE, page, repo_type
         );
         let output = gh_command(token)
             .args([
