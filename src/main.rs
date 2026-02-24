@@ -286,8 +286,20 @@ struct PruneResult {
     errors: Vec<String>,
 }
 
-/// List remote branches for a repo using `gh api`
-fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Result<Vec<String>> {
+/// Branch info returned from the API, including the last commit date
+/// for age-based filtering without extra per-branch API calls.
+struct BranchInfo {
+    name: String,
+    commit_date: Option<String>,
+}
+
+/// List remote branches for a repo using `gh api`.
+/// Returns branch names and their last commit dates in a single batch.
+fn list_remote_branches(
+    token: &Option<String>,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<BranchInfo>> {
     let mut branches = Vec::new();
     let mut page = 1;
 
@@ -297,7 +309,12 @@ fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Resu
             owner, repo, page
         );
         let output = gh_command(token)
-            .args(["api", &endpoint, "--jq", ".[].name"])
+            .args([
+                "api",
+                &endpoint,
+                "--jq",
+                r#".[] | .name + "\t" + .commit.commit.committer.date"#,
+            ])
             .output()
             .context("Failed to run gh api")?;
 
@@ -307,10 +324,26 @@ fn list_remote_branches(token: &Option<String>, owner: &str, repo: &str) -> Resu
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let page_branches: Vec<String> = stdout
+        let page_branches: Vec<BranchInfo> = stdout
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
+            .map(|l| {
+                if let Some((name, date)) = l.split_once('\t') {
+                    BranchInfo {
+                        name: name.to_string(),
+                        commit_date: if date.is_empty() || date == "null" {
+                            None
+                        } else {
+                            Some(date.to_string())
+                        },
+                    }
+                } else {
+                    BranchInfo {
+                        name: l.to_string(),
+                        commit_date: None,
+                    }
+                }
+            })
             .collect();
 
         if page_branches.is_empty() {
@@ -453,43 +486,21 @@ fn get_default_branch(token: &Option<String>, owner: &str, repo: &str) -> Result
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Get the age in days of the last commit on a branch.
-/// Returns None if the date cannot be determined.
-fn get_branch_age_days(
-    token: &Option<String>,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-) -> Option<u64> {
-    let endpoint = format!("repos/{}/{}/branches/{}", owner, repo, branch);
-    let output = gh_command(token)
-        .args(["api", &endpoint, "--jq", ".commit.commit.committer.date"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let date_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if date_str.is_empty() {
-        return None;
-    }
-
-    // Parse ISO 8601 date like "2025-06-15T12:34:56Z"
-    // Extract just the date part and compute days since then
+/// Compute the age of a branch in days from its commit date string.
+/// Uses the batch-fetched date from `list_remote_branches` — no extra API call.
+fn branch_age_days(commit_date: &Option<String>) -> Option<u64> {
+    let date_str = commit_date.as_deref()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-
-    // Simple ISO 8601 parser for "YYYY-MM-DDThh:mm:ssZ"
-    parse_iso8601_age_days(&date_str, now)
+    parse_iso8601_age_days(date_str, now)
 }
 
 /// Parse an ISO 8601 datetime string and return days elapsed since then.
+/// Handles both "Z" and "+00:00" / "-00:00" timezone suffixes.
 fn parse_iso8601_age_days(date_str: &str, now_epoch_secs: u64) -> Option<u64> {
-    // Expected format: "2025-06-15T12:34:56Z"
+    // Expected formats: "2025-06-15T12:34:56Z" or "2025-06-15T12:34:56+00:00"
     let parts: Vec<&str> = date_str.split('T').collect();
     if parts.len() != 2 {
         return None;
@@ -501,7 +512,23 @@ fn parse_iso8601_age_days(date_str: &str, now_epoch_secs: u64) -> Option<u64> {
     }
     let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
 
-    let time_str = parts[1].trim_end_matches('Z');
+    // Strip timezone suffix: "Z", "+00:00", "-05:00", etc.
+    let time_part = parts[1];
+    let time_str = if let Some(idx) = time_part.find('Z') {
+        &time_part[..idx]
+    } else if let Some(idx) = time_part.find('+') {
+        &time_part[..idx]
+    } else if let Some(idx) = time_part.rfind('-') {
+        // rfind to skip the date hyphens; only match if after "HH:MM:SS"
+        if idx >= 8 {
+            &time_part[..idx]
+        } else {
+            time_part
+        }
+    } else {
+        time_part
+    };
+
     let time_parts: Vec<u64> = time_str.split(':').filter_map(|p| p.parse().ok()).collect();
     if time_parts.len() != 3 {
         return None;
@@ -552,7 +579,7 @@ fn prune_repo(
     let full_name = format!("{}/{}", owner, repo);
     eprintln!("Scanning {}...", full_name);
 
-    let branches = list_remote_branches(token, owner, repo)?;
+    let branch_infos = list_remote_branches(token, owner, repo)?;
     let open_pr_branches = list_open_pr_branches(token, owner, repo)?;
 
     // Auto-protect the default branch to avoid HTTP 422 errors
@@ -567,8 +594,8 @@ fn prune_repo(
         open_pr_branches.iter().map(|s| s.as_str()).collect();
 
     let mut result = PruneResult {
-        repo: full_name.clone(),
-        branches_scanned: branches.len(),
+        repo: full_name,
+        branches_scanned: branch_infos.len(),
         branches_deleted: Vec::new(),
         branches_protected: Vec::new(),
         branches_with_open_prs: Vec::new(),
@@ -576,24 +603,24 @@ fn prune_repo(
         errors: Vec::new(),
     };
 
-    for branch in &branches {
-        if protected_set.contains(branch.as_str()) {
-            result.branches_protected.push(branch.clone());
+    for bi in &branch_infos {
+        if protected_set.contains(bi.name.as_str()) {
+            result.branches_protected.push(bi.name.clone());
             continue;
         }
-        if pr_set.contains(branch.as_str()) {
-            result.branches_with_open_prs.push(branch.clone());
+        if pr_set.contains(bi.name.as_str()) {
+            result.branches_with_open_prs.push(bi.name.clone());
             continue;
         }
 
-        // Check branch age if --stale-days is set
+        // Check branch age if --stale-days is set (uses batch-fetched date, no extra API call)
         if stale_days > 0 {
-            if let Some(age) = get_branch_age_days(token, owner, repo, branch) {
+            if let Some(age) = branch_age_days(&bi.commit_date) {
                 if age < stale_days {
-                    result.branches_skipped_recent.push(branch.clone());
+                    result.branches_skipped_recent.push(bi.name.clone());
                     eprintln!(
                         "  skipped ({}d old, threshold {}d): {}",
-                        age, stale_days, branch
+                        age, stale_days, bi.name
                     );
                     continue;
                 }
@@ -603,17 +630,17 @@ fn prune_repo(
 
         // This branch is stale — delete it
         if dry_run {
-            result.branches_deleted.push(branch.clone());
-            eprintln!("  [dry-run] would delete: {}", branch);
+            result.branches_deleted.push(bi.name.clone());
+            eprintln!("  [dry-run] would delete: {}", bi.name);
         } else {
-            match delete_remote_branch(token, owner, repo, branch) {
+            match delete_remote_branch(token, owner, repo, &bi.name) {
                 Ok(()) => {
-                    result.branches_deleted.push(branch.clone());
-                    eprintln!("  deleted: {}", branch);
+                    result.branches_deleted.push(bi.name.clone());
+                    eprintln!("  deleted: {}", bi.name);
                 }
                 Err(e) => {
-                    result.errors.push(format!("{}: {}", branch, e));
-                    eprintln!("  error deleting {}: {}", branch, e);
+                    result.errors.push(format!("{}: {}", bi.name, e));
+                    eprintln!("  error deleting {}: {}", bi.name, e);
                 }
             }
         }
@@ -1035,20 +1062,60 @@ mod tests {
     }
 
     #[test]
-    fn test_get_branch_age_days_integration() {
+    fn test_parse_iso8601_timezone_offset_format() {
+        let now = 1772020800; // ~2026-02-24
+                              // "+00:00" format (common GitHub API response)
+        let age = parse_iso8601_age_days("2026-02-24T00:00:00+00:00", now);
+        assert!(age.is_some(), "Should parse +00:00 timezone format");
+        assert!(age.unwrap() <= 2);
+
+        // "-05:00" format
+        let age2 = parse_iso8601_age_days("2026-02-24T00:00:00-05:00", now);
+        assert!(age2.is_some(), "Should parse -05:00 timezone format");
+    }
+
+    #[test]
+    fn test_branch_age_days_from_batch_data() {
+        // Simulate batch-fetched commit date
+        let date = Some("2026-01-01T00:00:00Z".to_string());
+        let age = branch_age_days(&date);
+        assert!(age.is_some());
+        assert!(age.unwrap() > 30, "Jan 1 should be > 30 days old");
+
+        // None date returns None
+        assert_eq!(branch_age_days(&None), None);
+    }
+
+    #[test]
+    fn test_list_remote_branches_returns_dates_integration() {
         if std::env::var("GH_TOKEN").is_err() && std::env::var("GH_APP_PRIVATE_KEY_FILE").is_err() {
             eprintln!("Skipping integration test: no GitHub auth available");
             return;
         }
 
         let token = resolve_gh_token();
+        let branches =
+            list_remote_branches(&token, "lornu-ai", "lornu-ai-cleaner").expect("Failed to list");
 
-        // The main branch of lornu-ai-cleaner should have a recent commit (< 7 days)
-        let age = get_branch_age_days(&token, "lornu-ai", "lornu-ai-cleaner", "develop");
-        assert!(age.is_some(), "Should be able to get branch age");
+        assert!(!branches.is_empty(), "Should have at least one branch");
+
+        // Every branch should have a commit date
+        for bi in &branches {
+            assert!(
+                bi.commit_date.is_some(),
+                "Branch {} should have a commit date",
+                bi.name
+            );
+        }
+
+        // develop branch should have a recent commit
+        let develop = branches.iter().find(|b| b.name == "develop");
+        assert!(develop.is_some(), "Should have develop branch");
+        let age = branch_age_days(&develop.unwrap().commit_date);
+        assert!(age.is_some());
         assert!(
             age.unwrap() < 7,
-            "develop branch should have recent commits, got {} days",
+            "develop should have recent commits, got {} days",
             age.unwrap()
         );
     }
