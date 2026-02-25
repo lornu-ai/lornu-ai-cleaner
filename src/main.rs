@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use walkdir::WalkDir;
+
 
 // --- GitHub App Auth ---
 
@@ -248,17 +249,12 @@ fn build_scan_patterns() -> Vec<Pattern> {
     ]
 }
 
-/// Check if a file path should be skipped during scanning.
+/// Check if a file should be skipped based on extension or filename.
+///
+/// Note: Hidden files, `.gitignore` patterns, and common directories like
+/// `target/`, `node_modules/`, `.git/` are already handled by `ignore::WalkBuilder`.
+/// This function only filters by extension and lockfile name.
 fn should_skip_scan_path(path: &std::path::Path) -> bool {
-    let path_str = path.to_string_lossy();
-    if path_str.contains("/.")
-        || path_str.contains("/target/")
-        || path_str.contains("/node_modules/")
-        || path_str.contains("/venv/")
-    {
-        return true;
-    }
-
     // Skip files that commonly produce false positives (lock files, certs, binaries)
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         if matches!(
@@ -342,9 +338,15 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
     let patterns = build_scan_patterns();
     let mut all_findings: Vec<ScanFinding> = Vec::new();
 
-    for entry in WalkDir::new(&root)
+    // Use ignore::WalkBuilder to respect .gitignore, skip hidden files,
+    // and automatically exclude target/, node_modules/, .git/, etc.
+    for entry in WalkBuilder::new(&root)
         .follow_links(true)
-        .into_iter()
+        .hidden(true) // skip hidden files/dirs
+        .git_ignore(true) // respect .gitignore
+        .git_global(true) // respect global gitignore
+        .git_exclude(true) // respect .git/info/exclude
+        .build()
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -1379,14 +1381,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_skip_scan_path_hidden_dirs() {
-        assert!(should_skip_scan_path(std::path::Path::new(
-            "/repo/.git/config"
-        )));
-        assert!(should_skip_scan_path(std::path::Path::new("/repo/.env")));
-    }
-
-    #[test]
     fn test_should_skip_scan_path_normal_files_not_skipped() {
         assert!(!should_skip_scan_path(std::path::Path::new(
             "/repo/src/main.rs"
@@ -1397,6 +1391,66 @@ mod tests {
         assert!(!should_skip_scan_path(std::path::Path::new(
             "/repo/src/lib.rs"
         )));
+    }
+
+    #[test]
+    fn test_gitignore_walk_skips_ignored_files() {
+        // Create a temp dir with a .gitignore and a file that should be ignored
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Init git repo so ignore crate respects .gitignore
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Write .gitignore
+        fs::write(root.join(".gitignore"), "secret_dir/\n*.log\n").unwrap();
+
+        // Create files: one normal, one in ignored dir, one with ignored extension
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+        fs::create_dir_all(root.join("secret_dir")).unwrap();
+        fs::write(root.join("secret_dir/keys.txt"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+        fs::write(root.join("debug.log"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+
+        // Walk with ignore crate
+        let mut found_files = Vec::new();
+        for entry in WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().is_file() {
+                found_files.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+
+        assert!(
+            found_files.iter().any(|f| f.contains("src/main.rs")),
+            "Should find src/main.rs, got: {:?}",
+            found_files
+        );
+        assert!(
+            !found_files.iter().any(|f| f.contains("secret_dir")),
+            "Should NOT find secret_dir/keys.txt, got: {:?}",
+            found_files
+        );
+        assert!(
+            !found_files.iter().any(|f| f.contains("debug.log")),
+            "Should NOT find debug.log, got: {:?}",
+            found_files
+        );
     }
 
     // --- Tests for scan_file_content (line-level scanning, issue #14) ---
