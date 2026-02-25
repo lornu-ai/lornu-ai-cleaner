@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use walkdir::WalkDir;
 
 // --- GitHub App Auth ---
 
@@ -150,6 +150,10 @@ enum Commands {
         /// Confirm deletion (required to delete files)
         #[arg(long)]
         confirm: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Prune stale remote branches not in main/develop or open PRs
@@ -200,10 +204,15 @@ impl Pattern {
     }
 }
 
-fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool) -> Result<()> {
-    println!("Starting cleanup scan in: {:?}", root);
+#[derive(Debug, Serialize)]
+struct ScanFinding {
+    file: String,
+    pattern: String,
+    line: usize,
+}
 
-    let patterns = vec![
+fn build_scan_patterns() -> Vec<Pattern> {
+    vec![
         // Payment
         Pattern::new("Stripe Secret Key", r"sk_live_[0-9a-zA-Z]{24,}"),
         Pattern::new("Stripe Publishable Key", r"pk_live_[0-9a-zA-Z]{24,}"),
@@ -236,13 +245,108 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool) -> Result<()> {
             "Generic Secret Assignment",
             r#"(?i)(secret|token|password|api_key|apikey|auth_token|access_token)\s*[=:]\s*["'][A-Za-z0-9/+=_\-]{20,}["']"#,
         ),
-    ];
+    ]
+}
 
-    let mut sensitive_files = Vec::new();
+/// Check if a file should be skipped based on extension or filename.
+///
+/// Note: Hidden files, `.gitignore` patterns, and common directories like
+/// `target/`, `node_modules/`, `.git/` are already handled by `ignore::WalkBuilder`.
+/// This function only filters by extension and lockfile name.
+fn should_skip_scan_path(path: &std::path::Path) -> bool {
+    // Skip files that commonly produce false positives (lock files, certs, binaries)
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if matches!(
+            ext,
+            "lock"
+                | "sum"
+                | "pem"
+                | "crt"
+                | "cer"
+                | "der"
+                | "p12"
+                | "pfx"
+                | "min.js"
+                | "map"
+                | "wasm"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "ico"
+                | "svg"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "eot"
+                | "pdf"
+        ) {
+            return true;
+        }
+    }
 
-    for entry in WalkDir::new(&root)
+    // Skip files by name that are known false-positive generators
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if matches!(
+            name,
+            "Cargo.lock"
+                | "package-lock.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "go.sum"
+                | "Gemfile.lock"
+                | "poetry.lock"
+                | "composer.lock"
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Scan file content for pattern matches, returning per-line findings.
+#[cfg(test)]
+fn scan_file_content(
+    path: &std::path::Path,
+    content: &str,
+    patterns: &[Pattern],
+) -> Vec<ScanFinding> {
+    let mut findings = Vec::new();
+    let file_str = path.display().to_string();
+
+    for (line_num, line) in content.lines().enumerate() {
+        for pattern in patterns {
+            if pattern.regex.is_match(line) {
+                findings.push(ScanFinding {
+                    file: file_str.clone(),
+                    pattern: pattern.name.to_string(),
+                    line: line_num + 1,
+                });
+            }
+        }
+    }
+
+    findings
+}
+
+fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> Result<()> {
+    if !json_output {
+        println!("Starting cleanup scan in: {:?}", root);
+    }
+
+    let patterns = build_scan_patterns();
+    let mut all_findings: Vec<ScanFinding> = Vec::new();
+
+    // Use ignore::WalkBuilder to respect .gitignore, skip hidden files,
+    // and automatically exclude target/, node_modules/, .git/, etc.
+    for entry in WalkBuilder::new(&root)
         .follow_links(true)
-        .into_iter()
+        .hidden(true) // skip hidden files/dirs
+        .git_ignore(true) // respect .gitignore
+        .git_global(true) // respect global gitignore
+        .git_exclude(true) // respect .git/info/exclude
+        .build()
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -250,95 +354,86 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool) -> Result<()> {
             continue;
         }
 
-        if path.to_string_lossy().contains("/.")
-            || path.to_string_lossy().contains("/target/")
-            || path.to_string_lossy().contains("/node_modules/")
-            || path.to_string_lossy().contains("/venv/")
-        {
+        if should_skip_scan_path(path) {
             continue;
         }
 
-        // Skip files that commonly produce false positives (lock files, certs, binaries)
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if matches!(
-                ext,
-                "lock"
-                    | "sum"
-                    | "pem"
-                    | "crt"
-                    | "cer"
-                    | "der"
-                    | "p12"
-                    | "pfx"
-                    | "min.js"
-                    | "map"
-                    | "wasm"
-                    | "png"
-                    | "jpg"
-                    | "jpeg"
-                    | "gif"
-                    | "ico"
-                    | "svg"
-                    | "woff"
-                    | "woff2"
-                    | "ttf"
-                    | "eot"
-                    | "pdf"
-            ) {
-                continue;
-            }
-        }
-        // Also skip files by name that are known false-positive generators
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if matches!(
-                name,
-                "Cargo.lock"
-                    | "package-lock.json"
-                    | "yarn.lock"
-                    | "pnpm-lock.yaml"
-                    | "go.sum"
-                    | "Gemfile.lock"
-                    | "poetry.lock"
-                    | "composer.lock"
-            ) {
-                continue;
-            }
-        }
+        if let Ok(file) = fs::File::open(path) {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(file);
+            let mut findings = Vec::new();
+            let file_str = path.display().to_string();
 
-        if let Ok(content) = fs::read_to_string(path) {
-            for pattern in &patterns {
-                if pattern.regex.is_match(&content) {
-                    println!("Sensitive Pattern Found: {} in {:?}", pattern.name, path);
-                    sensitive_files.push(path.to_path_buf());
-                    break;
+            for (line_num, line_result) in reader.lines().enumerate() {
+                if let Ok(line) = line_result {
+                    for pattern in &patterns {
+                        if pattern.regex.is_match(&line) {
+                            findings.push(ScanFinding {
+                                file: file_str.clone(),
+                                pattern: pattern.name.to_string(),
+                                line: line_num + 1,
+                            });
+                        }
+                    }
                 }
             }
+
+            if !findings.is_empty() && !json_output {
+                for f in &findings {
+                    println!("{}:{}: {}", f.file, f.line, f.pattern);
+                }
+            }
+            all_findings.extend(findings);
         }
     }
 
+    // Collect unique files with findings for deletion logic
+    let sensitive_files: Vec<PathBuf> = all_findings
+        .iter()
+        .map(|f| &f.file)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
     if sensitive_files.is_empty() {
-        println!("No sensitive files found.");
+        if json_output {
+            println!("[]");
+        } else {
+            println!("No sensitive files found.");
+        }
         return Ok(());
     }
 
-    println!("\nFound {} sensitive files:", sensitive_files.len());
-    for file in &sensitive_files {
-        println!(" - {:?}", file);
-    }
-
-    if dry_run {
-        println!("\nDRY RUN: No files were deleted.");
-    } else if confirm {
-        println!("\nDeleting sensitive files...");
-        for file in sensitive_files {
-            if let Err(e) = fs::remove_file(&file) {
+    // Perform deletion before outputting results
+    if !dry_run && confirm {
+        if !json_output {
+            println!("\nDeleting sensitive files...");
+        }
+        for file in &sensitive_files {
+            if let Err(e) = fs::remove_file(file) {
                 eprintln!("Failed to delete {:?}: {}", file, e);
-            } else {
+            } else if !json_output {
                 println!("Deleted {:?}", file);
             }
         }
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&all_findings)?;
+        println!("{}", json);
     } else {
-        println!("\nRun with --confirm to delete these files.");
+        println!(
+            "\nFound {} findings in {} files:",
+            all_findings.len(),
+            sensitive_files.len()
+        );
+
+        if dry_run {
+            println!("\nDRY RUN: No files were deleted.");
+        } else if !confirm {
+            println!("\nRun with --confirm to delete these files.");
+        }
     }
 
     Ok(())
@@ -781,18 +876,49 @@ fn cmd_prune(
         let json = serde_json::to_string_pretty(&all_results)?;
         println!("{}", json);
     } else {
-        let total_deleted: usize = all_results.iter().map(|r| r.branches_deleted.len()).sum();
-        let total_scanned: usize = all_results.iter().map(|r| r.branches_scanned).sum();
-        println!(
-            "\nTotal: {} repos, {} branches scanned, {} {}",
-            all_results.len(),
-            total_scanned,
-            total_deleted,
-            if dry_run { "would delete" } else { "deleted" },
-        );
+        println!("\n{}", format_prune_summary(&all_results, dry_run));
     }
 
     Ok(())
+}
+
+/// Format a human-readable summary table from prune results.
+fn format_prune_summary(results: &[PruneResult], dry_run: bool) -> String {
+    let total_scanned: usize = results.iter().map(|r| r.branches_scanned).sum();
+    let total_deleted: usize = results.iter().map(|r| r.branches_deleted.len()).sum();
+    let total_protected: usize = results.iter().map(|r| r.branches_protected.len()).sum();
+    let total_open_prs: usize = results.iter().map(|r| r.branches_with_open_prs.len()).sum();
+    let total_recent: usize = results
+        .iter()
+        .map(|r| r.branches_skipped_recent.len())
+        .sum();
+    let total_errors: usize = results.iter().map(|r| r.errors.len()).sum();
+
+    let action = if dry_run { "Would delete" } else { "Deleted" };
+    let label = if dry_run {
+        "Summary (dry-run):"
+    } else {
+        "Summary:"
+    };
+
+    let action_label = format!("{}:", action);
+    let mut lines = vec![
+        label.to_string(),
+        format!("  {:<18} {}", "Repos scanned:", results.len()),
+        format!("  {:<18} {}", "Branches scanned:", total_scanned),
+        format!("  {:<18} {}", action_label, total_deleted),
+        format!("  {:<18} {}", "Protected:", total_protected),
+        format!("  {:<18} {}", "Open PRs:", total_open_prs),
+    ];
+
+    if total_recent > 0 {
+        lines.push(format!("  {:<18} {}", "Skipped (recent):", total_recent));
+    }
+    if total_errors > 0 {
+        lines.push(format!("  {:<18} {}", "Errors:", total_errors));
+    }
+
+    lines.join("\n")
 }
 
 // --- Main ---
@@ -806,7 +932,8 @@ fn main() -> Result<()> {
             root,
             dry_run,
             confirm,
-        } => cmd_scan(root, dry_run, confirm),
+            json,
+        } => cmd_scan(root, dry_run, confirm, json),
         Commands::Prune {
             org,
             repo,
@@ -994,7 +1121,7 @@ mod tests {
     #[test]
     fn test_default_branch_added_to_protected_set() {
         // Simulate what prune_repo does: merge user-provided protected + default branch
-        let protected = vec!["main".to_string(), "develop".to_string()];
+        let protected = ["main".to_string(), "develop".to_string()];
         let default_branch = "master".to_string(); // repo's default is master
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1009,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_default_branch_no_duplicate_when_already_protected() {
-        let protected = vec!["main".to_string(), "develop".to_string()];
+        let protected = ["main".to_string(), "develop".to_string()];
         let default_branch = "main".to_string(); // already in protected list
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1024,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_empty_default_branch_does_not_add_to_protected() {
-        let protected = vec!["main".to_string()];
+        let protected = ["main".to_string()];
         let default_branch = String::new();
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1039,7 +1166,7 @@ mod tests {
     fn test_default_branch_prevents_deletion() {
         // The default branch should appear in the protected list, not the delete list
         let branches = vec!["master", "feat/old", "bugfix/stale"];
-        let protected = vec!["main", "develop"];
+        let protected = ["main", "develop"];
         let default_branch = "master";
 
         let mut protected_set: HashSet<&str> = protected.iter().copied().collect();
@@ -1159,38 +1286,6 @@ mod tests {
 
     // --- Tests for scan patterns (issue #5: reduce false positives) ---
 
-    fn build_patterns() -> Vec<Pattern> {
-        vec![
-            Pattern::new("Stripe Secret Key", r"sk_live_[0-9a-zA-Z]{24,}"),
-            Pattern::new("Stripe Publishable Key", r"pk_live_[0-9a-zA-Z]{24,}"),
-            Pattern::new("Stripe Test Secret Key", r"sk_test_[0-9a-zA-Z]{24,}"),
-            Pattern::new("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
-            Pattern::new(
-                "AWS Secret Key",
-                r#"(?i)(aws_secret_access_key|aws_secret)\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}"#,
-            ),
-            Pattern::new(
-                "GCP Private Key",
-                concat!("-----BEGIN PRIVATE ", "KEY-----"),
-            ),
-            Pattern::new("GCP Service Account", r#""type"\s*:\s*"service_account""#),
-            Pattern::new("GitHub Token (ghp)", r"ghp_[A-Za-z0-9]{36,}"),
-            Pattern::new("GitHub Token (gho)", r"gho_[A-Za-z0-9]{36,}"),
-            Pattern::new("GitHub Token (ghu)", r"ghu_[A-Za-z0-9]{36,}"),
-            Pattern::new("GitHub Token (ghs)", r"ghs_[A-Za-z0-9]{36,}"),
-            Pattern::new("GitHub Token (ghr)", r"ghr_[A-Za-z0-9]{36,}"),
-            Pattern::new("Slack Token", r"xox[bporas]-[0-9A-Za-z\-]{10,}"),
-            Pattern::new(
-                "Slack Webhook",
-                r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+",
-            ),
-            Pattern::new(
-                "Generic Secret Assignment",
-                r#"(?i)(secret|token|password|api_key|apikey|auth_token|access_token)\s*[=:]\s*["'][A-Za-z0-9/+=_\-]{20,}["']"#,
-            ),
-        ]
-    }
-
     fn any_pattern_matches(patterns: &[Pattern], content: &str) -> Vec<String> {
         patterns
             .iter()
@@ -1201,7 +1296,7 @@ mod tests {
 
     #[test]
     fn test_scan_matches_real_stripe_key() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         // Build test value at runtime to avoid GitHub push protection flagging it
         let fake_key = format!("sk_{}_abc123def456ghi789jkl012mno", "live");
         let content = format!(r#"STRIPE_KEY = "{}""#, fake_key);
@@ -1215,7 +1310,7 @@ mod tests {
 
     #[test]
     fn test_scan_matches_aws_access_key() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         let content = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE";
         let matches = any_pattern_matches(&patterns, content);
         assert!(
@@ -1227,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_scan_matches_github_token() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         let content = "export GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn";
         let matches = any_pattern_matches(&patterns, content);
         assert!(
@@ -1239,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_scan_matches_generic_secret_assignment() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         let content = r#"api_key = "sk_1234567890abcdefghij""#;
         let matches = any_pattern_matches(&patterns, content);
         assert!(
@@ -1251,7 +1346,7 @@ mod tests {
 
     #[test]
     fn test_scan_no_match_on_plain_sha256() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         // SHA-256 hashes should NOT trigger any pattern
         let content =
             "digest = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"";
@@ -1265,7 +1360,7 @@ mod tests {
 
     #[test]
     fn test_scan_no_match_on_uuid() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         let content = r#"id = "550e8400-e29b-41d4-a716-446655440000""#;
         let matches = any_pattern_matches(&patterns, content);
         assert!(
@@ -1277,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_scan_no_match_on_hex_version() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         let content = "version = \"0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d\"";
         let matches = any_pattern_matches(&patterns, content);
         assert!(
@@ -1289,7 +1384,7 @@ mod tests {
 
     #[test]
     fn test_scan_matches_slack_webhook() {
-        let patterns = build_patterns();
+        let patterns = build_scan_patterns();
         // Build at runtime to avoid GitHub push protection
         let content = format!(
             "https://hooks.slack.com/{}/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
@@ -1305,17 +1400,15 @@ mod tests {
 
     #[test]
     fn test_scan_skipped_extensions() {
-        // Verify the extension skip list logic
         let skip_exts = [
             "lock", "sum", "pem", "crt", "cer", "der", "p12", "pfx", "map", "wasm", "png", "jpg",
             "jpeg", "gif", "ico", "svg", "woff", "woff2", "ttf", "eot", "pdf",
         ];
         for ext in &skip_exts {
-            let path = std::path::Path::new("test").with_extension(ext);
-            assert_eq!(
-                path.extension().and_then(|e| e.to_str()),
-                Some(*ext),
-                "Extension {} should be extractable from path",
+            let path = std::path::Path::new("/repo/test").with_extension(ext);
+            assert!(
+                should_skip_scan_path(&path),
+                "Extension .{} should be skipped",
                 ext
             );
         }
@@ -1334,14 +1427,210 @@ mod tests {
             "composer.lock",
         ];
         for name in &skip_names {
-            let path = std::path::Path::new(name);
-            assert_eq!(
-                path.file_name().and_then(|n| n.to_str()),
-                Some(*name),
-                "Filename {} should be extractable",
+            let path = std::path::Path::new("/repo").join(name);
+            assert!(
+                should_skip_scan_path(&path),
+                "Lockfile {} should be skipped",
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_should_skip_scan_path_normal_files_not_skipped() {
+        assert!(!should_skip_scan_path(std::path::Path::new(
+            "/repo/src/main.rs"
+        )));
+        assert!(!should_skip_scan_path(std::path::Path::new(
+            "/repo/config.json"
+        )));
+        assert!(!should_skip_scan_path(std::path::Path::new(
+            "/repo/src/lib.rs"
+        )));
+    }
+
+    #[test]
+    fn test_gitignore_walk_skips_ignored_files() {
+        // Create a temp dir with a .gitignore and a file that should be ignored
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Init git repo so ignore crate respects .gitignore
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Write .gitignore
+        fs::write(root.join(".gitignore"), "secret_dir/\n*.log\n").unwrap();
+
+        // Create files: one normal, one in ignored dir, one with ignored extension
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+        fs::create_dir_all(root.join("secret_dir")).unwrap();
+        fs::write(root.join("secret_dir/keys.txt"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+        fs::write(root.join("debug.log"), "AKIAIOSFODNN7EXAMPLE").unwrap();
+
+        // Walk with ignore crate
+        let mut found_files = Vec::new();
+        for entry in WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().is_file() {
+                found_files.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+
+        assert!(
+            found_files.iter().any(|f| f.contains("src/main.rs")),
+            "Should find src/main.rs, got: {:?}",
+            found_files
+        );
+        assert!(
+            !found_files.iter().any(|f| f.contains("secret_dir")),
+            "Should NOT find secret_dir/keys.txt, got: {:?}",
+            found_files
+        );
+        assert!(
+            !found_files.iter().any(|f| f.contains("debug.log")),
+            "Should NOT find debug.log, got: {:?}",
+            found_files
+        );
+    }
+
+    // --- Tests for scan_file_content (line-level scanning, issue #14) ---
+
+    #[test]
+    fn test_scan_file_content_returns_line_numbers() {
+        let patterns = build_scan_patterns();
+        let content = "line one\nAKIAIOSFODNN7EXAMPLE\nline three\n";
+        let findings = scan_file_content(std::path::Path::new("test.txt"), content, &patterns);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
+        assert_eq!(findings[0].pattern, "AWS Access Key");
+        assert_eq!(findings[0].file, "test.txt");
+    }
+
+    #[test]
+    fn test_scan_file_content_multiple_findings_same_file() {
+        let patterns = build_scan_patterns();
+        let content = "AKIAIOSFODNN7EXAMPLE\nsome text\nAKIA1234567890123456\n";
+        let findings = scan_file_content(std::path::Path::new("multi.rs"), content, &patterns);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].line, 1);
+        assert_eq!(findings[1].line, 3);
+    }
+
+    #[test]
+    fn test_scan_file_content_no_findings() {
+        let patterns = build_scan_patterns();
+        let content = "fn main() {\n    println!(\"hello\");\n}\n";
+        let findings = scan_file_content(std::path::Path::new("clean.rs"), content, &patterns);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_scan_finding_serializes_to_json() {
+        let finding = ScanFinding {
+            file: "src/config.rs".to_string(),
+            pattern: "AWS Access Key".to_string(),
+            line: 42,
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        assert!(json.contains("\"file\":\"src/config.rs\""));
+        assert!(json.contains("\"pattern\":\"AWS Access Key\""));
+        assert!(json.contains("\"line\":42"));
+    }
+
+    #[test]
+    fn test_scan_empty_findings_serializes_to_empty_array() {
+        let findings: Vec<ScanFinding> = Vec::new();
+        let json = serde_json::to_string(&findings).unwrap();
+        assert_eq!(json, "[]");
+    }
+
+    // --- Tests for prune summary report (issue #16) ---
+
+    fn make_prune_result(
+        repo: &str,
+        scanned: usize,
+        deleted: usize,
+        protected: usize,
+        open_prs: usize,
+        recent: usize,
+        errors: usize,
+    ) -> PruneResult {
+        PruneResult {
+            repo: repo.to_string(),
+            branches_scanned: scanned,
+            branches_deleted: (0..deleted).map(|i| format!("del-{}", i)).collect(),
+            branches_protected: (0..protected).map(|i| format!("prot-{}", i)).collect(),
+            branches_with_open_prs: (0..open_prs).map(|i| format!("pr-{}", i)).collect(),
+            branches_skipped_recent: (0..recent).map(|i| format!("recent-{}", i)).collect(),
+            errors: (0..errors).map(|i| format!("err-{}", i)).collect(),
+        }
+    }
+
+    #[test]
+    fn test_format_prune_summary_dry_run() {
+        let results = vec![
+            make_prune_result("org/repo1", 50, 20, 10, 5, 15, 0),
+            make_prune_result("org/repo2", 30, 10, 8, 3, 9, 0),
+        ];
+        let summary = format_prune_summary(&results, true);
+        assert!(summary.contains("Summary (dry-run):"), "got:\n{}", summary);
+        assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
+        assert!(summary.contains("2"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Branches scanned:"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("80"), "got:\n{}", summary);
+        assert!(summary.contains("Would delete:"), "got:\n{}", summary);
+        assert!(summary.contains("30"), "got:\n{}", summary);
+        assert!(summary.contains("Protected:"), "got:\n{}", summary);
+        assert!(summary.contains("18"), "got:\n{}", summary);
+        assert!(summary.contains("Open PRs:"), "got:\n{}", summary);
+        assert!(summary.contains("Skipped (recent):"), "got:\n{}", summary);
+        assert!(summary.contains("24"), "got:\n{}", summary);
+        assert!(!summary.contains("Errors:"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_actual_run() {
+        let results = vec![make_prune_result("org/repo1", 20, 5, 10, 3, 0, 2)];
+        let summary = format_prune_summary(&results, false);
+        assert!(summary.contains("Summary:"), "got:\n{}", summary);
+        assert!(!summary.contains("dry-run"));
+        assert!(summary.contains("Deleted:"), "got:\n{}", summary);
+        assert!(summary.contains("5"), "got:\n{}", summary);
+        assert!(summary.contains("Errors:"), "got:\n{}", summary);
+        assert!(!summary.contains("Skipped (recent)"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_empty_results() {
+        let results: Vec<PruneResult> = Vec::new();
+        let summary = format_prune_summary(&results, true);
+        assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Branches scanned:"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("Would delete:"), "got:\n{}", summary);
     }
 
     #[test]
