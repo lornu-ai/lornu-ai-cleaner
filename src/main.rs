@@ -261,14 +261,14 @@ enum Commands {
 // --- Scan (sensitive file detection) ---
 
 struct Pattern {
-    name: &'static str,
+    name: String,
     regex: Regex,
 }
 
 impl Pattern {
-    fn new(name: &'static str, pattern: &'static str) -> Self {
+    fn new(name: &str, pattern: &str) -> Self {
         Self {
-            name,
+            name: name.to_string(),
             regex: Regex::new(pattern).expect("Invalid regex"),
         }
     }
@@ -288,10 +288,10 @@ fn build_scan_patterns_with_extras(extras: &[ExtraPattern]) -> Vec<Pattern> {
     for extra in extras {
         match Regex::new(&extra.regex) {
             Ok(regex) => {
-                // Leak the name string so we get a &'static str
-                // (patterns are built once and live for the program lifetime)
-                let name: &'static str = Box::leak(extra.name.clone().into_boxed_str());
-                patterns.push(Pattern { name, regex });
+                patterns.push(Pattern {
+                    name: extra.name.clone(),
+                    regex,
+                });
             }
             Err(e) => {
                 eprintln!(
@@ -540,6 +540,7 @@ fn cmd_scan_org(
     dry_run: bool,
     confirm: bool,
     json_output: bool,
+    config: &CleanerConfig,
 ) -> Result<()> {
     let token = resolve_gh_token();
     let repos = list_org_repos(&token, org, include_forks)?;
@@ -548,7 +549,7 @@ fn cmd_scan_org(
         eprintln!("Scanning {} repos in {}...", repos.len(), org);
     }
 
-    let patterns = build_scan_patterns();
+    let patterns = build_scan_patterns_with_extras(&config.scan.extra_patterns);
     let mut all_findings: Vec<ScanFinding> = Vec::new();
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
@@ -595,7 +596,7 @@ fn cmd_scan_org(
             if !path.is_file() {
                 continue;
             }
-            if should_skip_scan_path(path) {
+            if should_skip_scan_path_with_extras(path, &config.scan.skip_extensions) {
                 continue;
             }
 
@@ -1060,10 +1061,11 @@ fn cmd_prune(
 ) -> Result<()> {
     let token = resolve_gh_token();
 
-    // Merge CLI protected branches with config protected patterns
+    // Merge CLI protected branches with config protected patterns (O(N+M) via HashSet)
+    let mut seen: std::collections::HashSet<String> = protected.iter().cloned().collect();
     let mut merged_protected = protected;
     for p in &config.prune.protected {
-        if !merged_protected.contains(p) {
+        if seen.insert(p.clone()) {
             merged_protected.push(p.clone());
         }
     }
@@ -1195,7 +1197,7 @@ fn main() -> Result<()> {
             json,
         } => {
             if let Some(org_name) = org {
-                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json)
+                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json, &config)
             } else {
                 cmd_scan(root, dry_run, confirm, json, &config)
             }
