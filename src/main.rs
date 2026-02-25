@@ -139,9 +139,17 @@ struct Cli {
 enum Commands {
     /// Scan for sensitive files (API keys, secrets, credentials)
     Scan {
-        /// Root directory to scan
+        /// Root directory to scan (local mode)
         #[arg(short, long, default_value = ".")]
         root: PathBuf,
+
+        /// GitHub org to scan (clones all repos to temp dir; mutually exclusive with --root)
+        #[arg(long, conflicts_with = "root")]
+        org: Option<String>,
+
+        /// Include forked repos when scanning an org (by default forks are skipped)
+        #[arg(long)]
+        include_forks: bool,
 
         /// Dry run mode (don't delete files, just report)
         #[arg(long)]
@@ -209,6 +217,8 @@ struct ScanFinding {
     file: String,
     pattern: String,
     line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
 }
 
 fn build_scan_patterns() -> Vec<Pattern> {
@@ -306,11 +316,11 @@ fn should_skip_scan_path(path: &std::path::Path) -> bool {
 }
 
 /// Scan file content for pattern matches, returning per-line findings.
-#[cfg(test)]
 fn scan_file_content(
     path: &std::path::Path,
     content: &str,
     patterns: &[Pattern],
+    repo_name: Option<&str>,
 ) -> Vec<ScanFinding> {
     let mut findings = Vec::new();
     let file_str = path.display().to_string();
@@ -322,6 +332,7 @@ fn scan_file_content(
                     file: file_str.clone(),
                     pattern: pattern.name.to_string(),
                     line: line_num + 1,
+                    repo: repo_name.map(|s| s.to_string()),
                 });
             }
         }
@@ -358,26 +369,8 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
             continue;
         }
 
-        if let Ok(file) = fs::File::open(path) {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(file);
-            let mut findings = Vec::new();
-            let file_str = path.display().to_string();
-
-            for (line_num, line_result) in reader.lines().enumerate() {
-                if let Ok(line) = line_result {
-                    for pattern in &patterns {
-                        if pattern.regex.is_match(&line) {
-                            findings.push(ScanFinding {
-                                file: file_str.clone(),
-                                pattern: pattern.name.to_string(),
-                                line: line_num + 1,
-                            });
-                        }
-                    }
-                }
-            }
-
+        if let Ok(content) = fs::read_to_string(path) {
+            let findings = scan_file_content(path, &content, &patterns, None);
             if !findings.is_empty() && !json_output {
                 for f in &findings {
                     println!("{}:{}: {}", f.file, f.line, f.pattern);
@@ -436,6 +429,140 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
         }
     }
 
+    Ok(())
+}
+
+/// Scan all repos in a GitHub org by shallow-cloning to a temp directory.
+fn cmd_scan_org(
+    org: &str,
+    include_forks: bool,
+    dry_run: bool,
+    confirm: bool,
+    json_output: bool,
+) -> Result<()> {
+    let token = resolve_gh_token();
+    let repos = list_org_repos(&token, org, include_forks)?;
+
+    if !json_output {
+        eprintln!("Scanning {} repos in {}...", repos.len(), org);
+    }
+
+    let patterns = build_scan_patterns();
+    let mut all_findings: Vec<ScanFinding> = Vec::new();
+    let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+
+    for repo_name in &repos {
+        let repo_dir = tmp_dir.path().join(repo_name);
+
+        // Shallow clone using `gh repo clone` for secure auth (no token in ps output)
+        let full_repo_name = format!("{}/{}", org, repo_name);
+        let repo_dir_str = repo_dir.to_string_lossy();
+        let mut clone_cmd = gh_command(&token);
+        clone_cmd.args([
+            "repo",
+            "clone",
+            &full_repo_name,
+            &*repo_dir_str,
+            "--",
+            "--depth=1",
+            "--single-branch",
+        ]);
+        clone_cmd.stdout(std::process::Stdio::null());
+        clone_cmd.stderr(std::process::Stdio::null());
+
+        if !clone_cmd.status().map(|s| s.success()).unwrap_or(false) {
+            eprintln!("Failed to clone {}/{}, skipping", org, repo_name);
+            continue;
+        }
+
+        let full_name = format!("{}/{}", org, repo_name);
+        if !json_output {
+            eprintln!("  scanning {}...", full_name);
+        }
+
+        // Walk and scan
+        for entry in WalkBuilder::new(&repo_dir)
+            .follow_links(true)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if should_skip_scan_path(path) {
+                continue;
+            }
+
+            if let Ok(content) = fs::read_to_string(path) {
+                // Use relative path within the repo for cleaner output
+                let relative = path.strip_prefix(&repo_dir).unwrap_or(path);
+                let findings = scan_file_content(relative, &content, &patterns, Some(&full_name));
+                if !findings.is_empty() && !json_output {
+                    for f in &findings {
+                        println!("{} {}:{}: {}", full_name, f.file, f.line, f.pattern);
+                    }
+                }
+                all_findings.extend(findings);
+            }
+        }
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&all_findings)?;
+        println!("{}", json);
+    } else if all_findings.is_empty() {
+        println!("No sensitive files found across {} repos.", repos.len());
+    } else {
+        let unique_repos: std::collections::HashSet<&str> = all_findings
+            .iter()
+            .filter_map(|f| f.repo.as_deref())
+            .collect();
+        println!(
+            "\nFound {} findings across {} repos.",
+            all_findings.len(),
+            unique_repos.len()
+        );
+    }
+
+    // Handle deletion of files with findings (consistent with local scan behavior)
+    if !json_output && !all_findings.is_empty() {
+        let sensitive_files: Vec<PathBuf> = {
+            let mut seen = std::collections::HashSet::new();
+            all_findings
+                .iter()
+                .filter(|f| seen.insert(f.file.clone()))
+                .map(|f| PathBuf::from(&f.file))
+                .collect()
+        };
+
+        if dry_run {
+            println!("\nDRY RUN: No files were deleted.");
+        } else if confirm {
+            println!("\nDeleting sensitive files...");
+            for file in &sensitive_files {
+                for repo_name in &repos {
+                    let full_path = tmp_dir.path().join(repo_name).join(file);
+                    if full_path.exists() {
+                        if let Err(e) = fs::remove_file(&full_path) {
+                            eprintln!("Failed to delete {:?}: {}", file, e);
+                        } else {
+                            println!("Deleted {:?}", file);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            println!("\nRun with --confirm to delete these files.");
+        }
+    }
+
+    // tmp_dir is automatically cleaned up when dropped
     Ok(())
 }
 
@@ -930,10 +1057,18 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Scan {
             root,
+            org,
+            include_forks,
             dry_run,
             confirm,
             json,
-        } => cmd_scan(root, dry_run, confirm, json),
+        } => {
+            if let Some(org_name) = org {
+                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json)
+            } else {
+                cmd_scan(root, dry_run, confirm, json)
+            }
+        }
         Commands::Prune {
             org,
             repo,
@@ -1515,18 +1650,21 @@ mod tests {
     fn test_scan_file_content_returns_line_numbers() {
         let patterns = build_scan_patterns();
         let content = "line one\nAKIAIOSFODNN7EXAMPLE\nline three\n";
-        let findings = scan_file_content(std::path::Path::new("test.txt"), content, &patterns);
+        let findings =
+            scan_file_content(std::path::Path::new("test.txt"), content, &patterns, None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 2);
         assert_eq!(findings[0].pattern, "AWS Access Key");
         assert_eq!(findings[0].file, "test.txt");
+        assert!(findings[0].repo.is_none());
     }
 
     #[test]
     fn test_scan_file_content_multiple_findings_same_file() {
         let patterns = build_scan_patterns();
         let content = "AKIAIOSFODNN7EXAMPLE\nsome text\nAKIA1234567890123456\n";
-        let findings = scan_file_content(std::path::Path::new("multi.rs"), content, &patterns);
+        let findings =
+            scan_file_content(std::path::Path::new("multi.rs"), content, &patterns, None);
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].line, 1);
         assert_eq!(findings[1].line, 3);
@@ -1536,8 +1674,23 @@ mod tests {
     fn test_scan_file_content_no_findings() {
         let patterns = build_scan_patterns();
         let content = "fn main() {\n    println!(\"hello\");\n}\n";
-        let findings = scan_file_content(std::path::Path::new("clean.rs"), content, &patterns);
+        let findings =
+            scan_file_content(std::path::Path::new("clean.rs"), content, &patterns, None);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_scan_file_content_with_repo_name() {
+        let patterns = build_scan_patterns();
+        let content = "AKIAIOSFODNN7EXAMPLE\n";
+        let findings = scan_file_content(
+            std::path::Path::new("src/config.rs"),
+            content,
+            &patterns,
+            Some("org/my-repo"),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].repo.as_deref(), Some("org/my-repo"));
     }
 
     #[test]
@@ -1546,6 +1699,7 @@ mod tests {
             file: "src/config.rs".to_string(),
             pattern: "AWS Access Key".to_string(),
             line: 42,
+            repo: None,
         };
         let json = serde_json::to_string(&finding).unwrap();
         assert!(json.contains("\"file\":\"src/config.rs\""));
@@ -1558,6 +1712,30 @@ mod tests {
         let findings: Vec<ScanFinding> = Vec::new();
         let json = serde_json::to_string(&findings).unwrap();
         assert_eq!(json, "[]");
+    }
+
+    #[test]
+    fn test_scan_finding_with_repo_serializes_repo_field() {
+        let finding = ScanFinding {
+            file: "src/main.rs".to_string(),
+            pattern: "AWS Access Key".to_string(),
+            line: 10,
+            repo: Some("org/my-repo".to_string()),
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        assert!(json.contains("\"repo\":\"org/my-repo\""));
+    }
+
+    #[test]
+    fn test_scan_finding_without_repo_omits_repo_field() {
+        let finding = ScanFinding {
+            file: "src/main.rs".to_string(),
+            pattern: "AWS Access Key".to_string(),
+            line: 10,
+            repo: None,
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        assert!(!json.contains("repo"));
     }
 
     // --- Tests for prune summary report (issue #16) ---
@@ -1592,11 +1770,7 @@ mod tests {
         assert!(summary.contains("Summary (dry-run):"), "got:\n{}", summary);
         assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
         assert!(summary.contains("2"), "got:\n{}", summary);
-        assert!(
-            summary.contains("Branches scanned:"),
-            "got:\n{}",
-            summary
-        );
+        assert!(summary.contains("Branches scanned:"), "got:\n{}", summary);
         assert!(summary.contains("80"), "got:\n{}", summary);
         assert!(summary.contains("Would delete:"), "got:\n{}", summary);
         assert!(summary.contains("30"), "got:\n{}", summary);
@@ -1625,11 +1799,7 @@ mod tests {
         let results: Vec<PruneResult> = Vec::new();
         let summary = format_prune_summary(&results, true);
         assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
-        assert!(
-            summary.contains("Branches scanned:"),
-            "got:\n{}",
-            summary
-        );
+        assert!(summary.contains("Branches scanned:"), "got:\n{}", summary);
         assert!(summary.contains("Would delete:"), "got:\n{}", summary);
     }
 
