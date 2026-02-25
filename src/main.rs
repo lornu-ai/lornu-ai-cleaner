@@ -433,7 +433,13 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
 }
 
 /// Scan all repos in a GitHub org by shallow-cloning to a temp directory.
-fn cmd_scan_org(org: &str, include_forks: bool, json_output: bool) -> Result<()> {
+fn cmd_scan_org(
+    org: &str,
+    include_forks: bool,
+    dry_run: bool,
+    confirm: bool,
+    json_output: bool,
+) -> Result<()> {
     let token = resolve_gh_token();
     let repos = list_org_repos(&token, org, include_forks)?;
 
@@ -448,26 +454,21 @@ fn cmd_scan_org(org: &str, include_forks: bool, json_output: bool) -> Result<()>
     for repo_name in &repos {
         let repo_dir = tmp_dir.path().join(repo_name);
 
-        // Shallow clone
-        let clone_url = format!("https://github.com/{}/{}.git", org, repo_name);
-        let mut clone_cmd = Command::new("git");
-        clone_cmd.args(["clone", "--depth", "1", "--single-branch", &clone_url]);
-        clone_cmd.arg(&repo_dir);
+        // Shallow clone using `gh repo clone` for secure auth (no token in ps output)
+        let full_repo_name = format!("{}/{}", org, repo_name);
+        let repo_dir_str = repo_dir.to_string_lossy();
+        let mut clone_cmd = gh_command(&token);
+        clone_cmd.args([
+            "repo",
+            "clone",
+            &full_repo_name,
+            &*repo_dir_str,
+            "--",
+            "--depth=1",
+            "--single-branch",
+        ]);
         clone_cmd.stdout(std::process::Stdio::null());
         clone_cmd.stderr(std::process::Stdio::null());
-
-        // Inject token for private repos
-        if let Some(t) = &token {
-            let auth_url = format!(
-                "https://x-access-token:{}@github.com/{}/{}.git",
-                t, org, repo_name
-            );
-            clone_cmd = Command::new("git");
-            clone_cmd.args(["clone", "--depth", "1", "--single-branch", &auth_url]);
-            clone_cmd.arg(&repo_dir);
-            clone_cmd.stdout(std::process::Stdio::null());
-            clone_cmd.stderr(std::process::Stdio::null());
-        }
 
         if !clone_cmd.status().map(|s| s.success()).unwrap_or(false) {
             eprintln!("Failed to clone {}/{}, skipping", org, repo_name);
@@ -526,6 +527,39 @@ fn cmd_scan_org(org: &str, include_forks: bool, json_output: bool) -> Result<()>
             all_findings.len(),
             unique_repos.len()
         );
+    }
+
+    // Handle deletion of files with findings (consistent with local scan behavior)
+    if !json_output && !all_findings.is_empty() {
+        let sensitive_files: Vec<PathBuf> = {
+            let mut seen = std::collections::HashSet::new();
+            all_findings
+                .iter()
+                .filter(|f| seen.insert(f.file.clone()))
+                .map(|f| PathBuf::from(&f.file))
+                .collect()
+        };
+
+        if dry_run {
+            println!("\nDRY RUN: No files were deleted.");
+        } else if confirm {
+            println!("\nDeleting sensitive files...");
+            for file in &sensitive_files {
+                for repo_name in &repos {
+                    let full_path = tmp_dir.path().join(repo_name).join(file);
+                    if full_path.exists() {
+                        if let Err(e) = fs::remove_file(&full_path) {
+                            eprintln!("Failed to delete {:?}: {}", file, e);
+                        } else {
+                            println!("Deleted {:?}", file);
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            println!("\nRun with --confirm to delete these files.");
+        }
     }
 
     // tmp_dir is automatically cleaned up when dropped
@@ -1030,7 +1064,7 @@ fn main() -> Result<()> {
             json,
         } => {
             if let Some(org_name) = org {
-                cmd_scan_org(&org_name, include_forks, json)
+                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json)
             } else {
                 cmd_scan(root, dry_run, confirm, json)
             }
