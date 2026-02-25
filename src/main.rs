@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn test_default_branch_added_to_protected_set() {
         // Simulate what prune_repo does: merge user-provided protected + default branch
-        let protected = vec!["main".to_string(), "develop".to_string()];
+        let protected = ["main".to_string(), "develop".to_string()];
         let default_branch = "master".to_string(); // repo's default is master
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_default_branch_no_duplicate_when_already_protected() {
-        let protected = vec!["main".to_string(), "develop".to_string()];
+        let protected = ["main".to_string(), "develop".to_string()];
         let default_branch = "main".to_string(); // already in protected list
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn test_empty_default_branch_does_not_add_to_protected() {
-        let protected = vec!["main".to_string()];
+        let protected = ["main".to_string()];
         let default_branch = String::new();
 
         let mut protected_set: HashSet<&str> = protected.iter().map(|s| s.as_str()).collect();
@@ -1139,7 +1139,7 @@ mod tests {
     fn test_default_branch_prevents_deletion() {
         // The default branch should appear in the protected list, not the delete list
         let branches = vec!["master", "feat/old", "bugfix/stale"];
-        let protected = vec!["main", "develop"];
+        let protected = ["main", "develop"];
         let default_branch = "master";
 
         let mut protected_set: HashSet<&str> = protected.iter().copied().collect();
