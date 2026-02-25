@@ -2,10 +2,66 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+
+// --- Config file support ---
+
+#[derive(Debug, Default, Deserialize)]
+struct CleanerConfig {
+    #[serde(default)]
+    prune: PruneConfig,
+    #[serde(default)]
+    scan: ScanConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PruneConfig {
+    #[serde(default)]
+    protected: Vec<String>,
+    #[serde(default)]
+    stale_days: Option<u64>,
+    #[serde(default)]
+    include_forks: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScanConfig {
+    #[serde(default)]
+    extra_patterns: Vec<ExtraPattern>,
+    #[serde(default)]
+    skip_extensions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtraPattern {
+    name: String,
+    regex: String,
+}
+
+fn load_config(config_path: Option<&PathBuf>) -> CleanerConfig {
+    let path = match config_path {
+        Some(p) => p.clone(),
+        None => PathBuf::from(".cleaner.toml"),
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str(&contents) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Warning: invalid config file {}: {}", path.display(), e);
+                CleanerConfig::default()
+            }
+        },
+        Err(_) => CleanerConfig::default(),
+    }
+}
+
+/// Check if a branch name matches a protected pattern (supports glob wildcards).
+fn matches_protected_pattern(branch: &str, pattern: &str) -> bool {
+    glob_match::glob_match(pattern, branch)
+}
 
 // --- GitHub App Auth ---
 
@@ -131,6 +187,10 @@ fn gh_command(token: &Option<String>) -> Command {
     about = "AI agent for repository hygiene: sensitive file scanning and branch pruning"
 )]
 struct Cli {
+    /// Path to config file (default: .cleaner.toml in CWD)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -199,17 +259,38 @@ enum Commands {
 // --- Scan (sensitive file detection) ---
 
 struct Pattern {
-    name: &'static str,
+    name: String,
     regex: Regex,
 }
 
 impl Pattern {
-    fn new(name: &'static str, pattern: &'static str) -> Self {
+    fn new(name: &str, pattern: &str) -> Self {
         Self {
-            name,
+            name: name.to_string(),
             regex: Regex::new(pattern).expect("Invalid regex"),
         }
     }
+}
+
+fn build_scan_patterns_with_extras(extras: &[ExtraPattern]) -> Vec<Pattern> {
+    let mut patterns = build_scan_patterns();
+    for extra in extras {
+        match Regex::new(&extra.regex) {
+            Ok(regex) => {
+                patterns.push(Pattern {
+                    name: extra.name.clone(),
+                    regex,
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: skipping invalid custom pattern '{}': {}",
+                    extra.name, e
+                );
+            }
+        }
+    }
+    patterns
 }
 
 #[derive(Debug, Serialize)]
@@ -263,7 +344,7 @@ fn build_scan_patterns() -> Vec<Pattern> {
 /// Note: Hidden files, `.gitignore` patterns, and common directories like
 /// `target/`, `node_modules/`, `.git/` are already handled by `ignore::WalkBuilder`.
 /// This function only filters by extension and lockfile name.
-fn should_skip_scan_path(path: &std::path::Path) -> bool {
+fn should_skip_scan_path(path: &std::path::Path, extra_skip_extensions: &[String]) -> bool {
     // Skip files that commonly produce false positives (lock files, certs, binaries)
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         if matches!(
@@ -291,6 +372,10 @@ fn should_skip_scan_path(path: &std::path::Path) -> bool {
                 | "eot"
                 | "pdf"
         ) {
+            return true;
+        }
+        // Check extra extensions from config
+        if extra_skip_extensions.iter().any(|e| e == ext) {
             return true;
         }
     }
@@ -341,12 +426,18 @@ fn scan_file_content(
     findings
 }
 
-fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> Result<()> {
+fn cmd_scan(
+    root: PathBuf,
+    dry_run: bool,
+    confirm: bool,
+    json_output: bool,
+    config: &CleanerConfig,
+) -> Result<()> {
     if !json_output {
         println!("Starting cleanup scan in: {:?}", root);
     }
 
-    let patterns = build_scan_patterns();
+    let patterns = build_scan_patterns_with_extras(&config.scan.extra_patterns);
     let mut all_findings: Vec<ScanFinding> = Vec::new();
 
     // Use ignore::WalkBuilder to respect .gitignore, skip hidden files,
@@ -365,7 +456,7 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
             continue;
         }
 
-        if should_skip_scan_path(path) {
+        if should_skip_scan_path(path, &config.scan.skip_extensions) {
             continue;
         }
 
@@ -439,6 +530,7 @@ fn cmd_scan_org(
     dry_run: bool,
     confirm: bool,
     json_output: bool,
+    config: &CleanerConfig,
 ) -> Result<()> {
     let token = resolve_gh_token();
     let repos = list_org_repos(&token, org, include_forks)?;
@@ -447,7 +539,7 @@ fn cmd_scan_org(
         eprintln!("Scanning {} repos in {}...", repos.len(), org);
     }
 
-    let patterns = build_scan_patterns();
+    let patterns = build_scan_patterns_with_extras(&config.scan.extra_patterns);
     let mut all_findings: Vec<ScanFinding> = Vec::new();
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
@@ -494,7 +586,7 @@ fn cmd_scan_org(
             if !path.is_file() {
                 continue;
             }
-            if should_skip_scan_path(path) {
+            if should_skip_scan_path(path, &config.scan.skip_extensions) {
                 continue;
             }
 
@@ -897,7 +989,11 @@ fn prune_repo(
     };
 
     for bi in &branch_infos {
-        if protected_set.contains(bi.name.as_str()) {
+        let is_protected = protected_set.contains(bi.name.as_str())
+            || protected
+                .iter()
+                .any(|p| matches_protected_pattern(&bi.name, p));
+        if is_protected {
             result.branches_protected.push(bi.name.clone());
             continue;
         }
@@ -942,6 +1038,7 @@ fn prune_repo(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prune(
     org: String,
     repo: Option<String>,
@@ -950,13 +1047,29 @@ fn cmd_prune(
     json_output: bool,
     include_forks: bool,
     stale_days: u64,
+    config: &CleanerConfig,
 ) -> Result<()> {
     let token = resolve_gh_token();
+
+    // Merge CLI protected with config protected (CLI takes precedence, config adds more)
+    let mut merged_protected = protected;
+    for p in &config.prune.protected {
+        if !merged_protected.contains(p) {
+            merged_protected.push(p.clone());
+        }
+    }
+    // Apply config defaults if CLI used defaults
+    let effective_stale_days = if stale_days == 0 {
+        config.prune.stale_days.unwrap_or(0)
+    } else {
+        stale_days
+    };
+    let effective_include_forks = include_forks || config.prune.include_forks.unwrap_or(false);
 
     let repos = if let Some(r) = repo {
         vec![r]
     } else {
-        list_org_repos(&token, &org, include_forks)?
+        list_org_repos(&token, &org, effective_include_forks)?
     };
 
     if dry_run {
@@ -966,7 +1079,14 @@ fn cmd_prune(
     let mut all_results = Vec::new();
 
     for repo_name in &repos {
-        match prune_repo(&token, &org, repo_name, &protected, dry_run, stale_days) {
+        match prune_repo(
+            &token,
+            &org,
+            repo_name,
+            &merged_protected,
+            dry_run,
+            effective_stale_days,
+        ) {
             Ok(result) => {
                 if !json_output {
                     let action = if dry_run { "would delete" } else { "deleted" };
@@ -1053,6 +1173,7 @@ fn format_prune_summary(results: &[PruneResult], dry_run: bool) -> String {
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
+    let config = load_config(cli.config.as_ref());
 
     match cli.command {
         Commands::Scan {
@@ -1064,9 +1185,9 @@ fn main() -> Result<()> {
             json,
         } => {
             if let Some(org_name) = org {
-                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json)
+                cmd_scan_org(&org_name, include_forks, dry_run, confirm, json, &config)
             } else {
-                cmd_scan(root, dry_run, confirm, json)
+                cmd_scan(root, dry_run, confirm, json, &config)
             }
         }
         Commands::Prune {
@@ -1085,6 +1206,7 @@ fn main() -> Result<()> {
             json,
             include_forks,
             stale_days,
+            &config,
         ),
     }
 }
@@ -1542,7 +1664,7 @@ mod tests {
         for ext in &skip_exts {
             let path = std::path::Path::new("/repo/test").with_extension(ext);
             assert!(
-                should_skip_scan_path(&path),
+                should_skip_scan_path(&path, &[]),
                 "Extension .{} should be skipped",
                 ext
             );
@@ -1564,7 +1686,7 @@ mod tests {
         for name in &skip_names {
             let path = std::path::Path::new("/repo").join(name);
             assert!(
-                should_skip_scan_path(&path),
+                should_skip_scan_path(&path, &[]),
                 "Lockfile {} should be skipped",
                 name
             );
@@ -1573,15 +1695,18 @@ mod tests {
 
     #[test]
     fn test_should_skip_scan_path_normal_files_not_skipped() {
-        assert!(!should_skip_scan_path(std::path::Path::new(
-            "/repo/src/main.rs"
-        )));
-        assert!(!should_skip_scan_path(std::path::Path::new(
-            "/repo/config.json"
-        )));
-        assert!(!should_skip_scan_path(std::path::Path::new(
-            "/repo/src/lib.rs"
-        )));
+        assert!(!should_skip_scan_path(
+            std::path::Path::new("/repo/src/main.rs"),
+            &[]
+        ));
+        assert!(!should_skip_scan_path(
+            std::path::Path::new("/repo/config.json"),
+            &[]
+        ));
+        assert!(!should_skip_scan_path(
+            std::path::Path::new("/repo/src/lib.rs"),
+            &[]
+        ));
     }
 
     #[test]
@@ -1835,5 +1960,121 @@ mod tests {
             "develop should have recent commits, got {} days",
             age.unwrap()
         );
+    }
+
+    // --- Config file tests (issue #18) ---
+
+    #[test]
+    fn test_load_config_missing_file_returns_default() {
+        let config = load_config(Some(&PathBuf::from("/nonexistent/.cleaner.toml")));
+        assert!(config.prune.protected.is_empty());
+        assert!(config.scan.extra_patterns.is_empty());
+        assert!(config.prune.stale_days.is_none());
+    }
+
+    #[test]
+    fn test_load_config_parses_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".cleaner.toml");
+        fs::write(
+            &config_path,
+            r#"
+[prune]
+protected = ["main", "release/*", "hotfix/*"]
+stale_days = 30
+include_forks = true
+
+[scan]
+skip_extensions = ["dat", "bin"]
+
+[[scan.extra_patterns]]
+name = "Internal Key"
+regex = "INTERNAL_[A-Z0-9]{32}"
+"#,
+        )
+        .unwrap();
+        let config = load_config(Some(&config_path));
+        assert_eq!(
+            config.prune.protected,
+            vec!["main", "release/*", "hotfix/*"]
+        );
+        assert_eq!(config.prune.stale_days, Some(30));
+        assert_eq!(config.prune.include_forks, Some(true));
+        assert_eq!(config.scan.skip_extensions, vec!["dat", "bin"]);
+        assert_eq!(config.scan.extra_patterns.len(), 1);
+        assert_eq!(config.scan.extra_patterns[0].name, "Internal Key");
+    }
+
+    #[test]
+    fn test_load_config_invalid_toml_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".cleaner.toml");
+        fs::write(&config_path, "this is not valid toml {{{{").unwrap();
+        let config = load_config(Some(&config_path));
+        assert!(config.prune.protected.is_empty());
+    }
+
+    #[test]
+    fn test_matches_protected_pattern_exact() {
+        assert!(matches_protected_pattern("main", "main"));
+        assert!(matches_protected_pattern("develop", "develop"));
+        assert!(!matches_protected_pattern("feature/foo", "main"));
+    }
+
+    #[test]
+    fn test_matches_protected_pattern_glob_wildcard() {
+        assert!(matches_protected_pattern("release/1.0", "release/*"));
+        assert!(matches_protected_pattern("release/2.3.4", "release/*"));
+        assert!(!matches_protected_pattern("feature/release", "release/*"));
+        assert!(matches_protected_pattern("hotfix/urgent-fix", "hotfix/*"));
+    }
+
+    #[test]
+    fn test_custom_scan_patterns_from_config() {
+        let extras = vec![ExtraPattern {
+            name: "Internal Key".to_string(),
+            regex: "INTERNAL_[A-Z0-9]{32}".to_string(),
+        }];
+        let patterns = build_scan_patterns_with_extras(&extras);
+        let builtin_count = build_scan_patterns().len();
+        assert_eq!(patterns.len(), builtin_count + 1);
+        assert_eq!(patterns.last().unwrap().name, "Internal Key");
+    }
+
+    #[test]
+    fn test_custom_scan_pattern_invalid_regex_skipped() {
+        let extras = vec![ExtraPattern {
+            name: "Bad Pattern".to_string(),
+            regex: "[invalid((".to_string(),
+        }];
+        let patterns = build_scan_patterns_with_extras(&extras);
+        let builtin_count = build_scan_patterns().len();
+        assert_eq!(patterns.len(), builtin_count); // invalid pattern was skipped
+    }
+
+    #[test]
+    fn test_skip_extensions_from_config() {
+        let extra_exts = vec!["dat".to_string(), "bin".to_string()];
+        assert!(should_skip_scan_path(
+            std::path::Path::new("/repo/data.dat"),
+            &extra_exts
+        ));
+        assert!(should_skip_scan_path(
+            std::path::Path::new("/repo/image.bin"),
+            &extra_exts
+        ));
+        assert!(!should_skip_scan_path(
+            std::path::Path::new("/repo/main.rs"),
+            &extra_exts
+        ));
+    }
+
+    #[test]
+    fn test_config_optional_works_without_file() {
+        // Default CWD likely doesn't have .cleaner.toml
+        let config = load_config(None);
+        // Should return defaults without error
+        assert!(config.prune.protected.is_empty());
+        assert!(config.scan.extra_patterns.is_empty());
     }
 }
