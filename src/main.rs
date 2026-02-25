@@ -7,7 +7,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-
 // --- GitHub App Auth ---
 
 mod gh_app {
@@ -851,18 +850,48 @@ fn cmd_prune(
         let json = serde_json::to_string_pretty(&all_results)?;
         println!("{}", json);
     } else {
-        let total_deleted: usize = all_results.iter().map(|r| r.branches_deleted.len()).sum();
-        let total_scanned: usize = all_results.iter().map(|r| r.branches_scanned).sum();
-        println!(
-            "\nTotal: {} repos, {} branches scanned, {} {}",
-            all_results.len(),
-            total_scanned,
-            total_deleted,
-            if dry_run { "would delete" } else { "deleted" },
-        );
+        println!("\n{}", format_prune_summary(&all_results, dry_run));
     }
 
     Ok(())
+}
+
+/// Format a human-readable summary table from prune results.
+fn format_prune_summary(results: &[PruneResult], dry_run: bool) -> String {
+    let total_scanned: usize = results.iter().map(|r| r.branches_scanned).sum();
+    let total_deleted: usize = results.iter().map(|r| r.branches_deleted.len()).sum();
+    let total_protected: usize = results.iter().map(|r| r.branches_protected.len()).sum();
+    let total_open_prs: usize = results.iter().map(|r| r.branches_with_open_prs.len()).sum();
+    let total_recent: usize = results
+        .iter()
+        .map(|r| r.branches_skipped_recent.len())
+        .sum();
+    let total_errors: usize = results.iter().map(|r| r.errors.len()).sum();
+
+    let action = if dry_run { "Would delete" } else { "Deleted" };
+    let label = if dry_run {
+        "Summary (dry-run):"
+    } else {
+        "Summary:"
+    };
+
+    let mut lines = vec![
+        label.to_string(),
+        format!("  Repos scanned:     {}", results.len()),
+        format!("  Branches scanned:  {}", total_scanned),
+        format!("  {}:  {}", action, total_deleted),
+        format!("  Protected:         {}", total_protected),
+        format!("  Open PRs:          {}", total_open_prs),
+    ];
+
+    if total_recent > 0 {
+        lines.push(format!("  Skipped (recent):  {}", total_recent));
+    }
+    if total_errors > 0 {
+        lines.push(format!("  Errors:            {}", total_errors));
+    }
+
+    lines.join("\n")
 }
 
 // --- Main ---
@@ -1502,6 +1531,97 @@ mod tests {
         let findings: Vec<ScanFinding> = Vec::new();
         let json = serde_json::to_string(&findings).unwrap();
         assert_eq!(json, "[]");
+    }
+
+    // --- Tests for prune summary report (issue #16) ---
+
+    fn make_prune_result(
+        repo: &str,
+        scanned: usize,
+        deleted: usize,
+        protected: usize,
+        open_prs: usize,
+        recent: usize,
+        errors: usize,
+    ) -> PruneResult {
+        PruneResult {
+            repo: repo.to_string(),
+            branches_scanned: scanned,
+            branches_deleted: (0..deleted).map(|i| format!("del-{}", i)).collect(),
+            branches_protected: (0..protected).map(|i| format!("prot-{}", i)).collect(),
+            branches_with_open_prs: (0..open_prs).map(|i| format!("pr-{}", i)).collect(),
+            branches_skipped_recent: (0..recent).map(|i| format!("recent-{}", i)).collect(),
+            errors: (0..errors).map(|i| format!("err-{}", i)).collect(),
+        }
+    }
+
+    #[test]
+    fn test_format_prune_summary_dry_run() {
+        let results = vec![
+            make_prune_result("org/repo1", 50, 20, 10, 5, 15, 0),
+            make_prune_result("org/repo2", 30, 10, 8, 3, 9, 0),
+        ];
+        let summary = format_prune_summary(&results, true);
+        assert!(summary.contains("Summary (dry-run):"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Repos scanned:     2"),
+            "got:\n{}",
+            summary
+        );
+        assert!(
+            summary.contains("Branches scanned:  80"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("Would delete:  30"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Protected:         18"),
+            "got:\n{}",
+            summary
+        );
+        assert!(
+            summary.contains("Open PRs:          8"),
+            "got:\n{}",
+            summary
+        );
+        assert!(
+            summary.contains("Skipped (recent):  24"),
+            "got:\n{}",
+            summary
+        );
+        assert!(!summary.contains("Errors:"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_actual_run() {
+        let results = vec![make_prune_result("org/repo1", 20, 5, 10, 3, 0, 2)];
+        let summary = format_prune_summary(&results, false);
+        assert!(summary.contains("Summary:"), "got:\n{}", summary);
+        assert!(!summary.contains("dry-run"));
+        assert!(summary.contains("Deleted:  5"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Errors:            2"),
+            "got:\n{}",
+            summary
+        );
+        assert!(!summary.contains("Skipped (recent)"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_empty_results() {
+        let results: Vec<PruneResult> = Vec::new();
+        let summary = format_prune_summary(&results, true);
+        assert!(
+            summary.contains("Repos scanned:     0"),
+            "got:\n{}",
+            summary
+        );
+        assert!(
+            summary.contains("Branches scanned:  0"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("Would delete:  0"), "got:\n{}", summary);
     }
 
     #[test]
