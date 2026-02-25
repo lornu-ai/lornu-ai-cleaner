@@ -306,6 +306,7 @@ fn should_skip_scan_path(path: &std::path::Path) -> bool {
 }
 
 /// Scan file content for pattern matches, returning per-line findings.
+#[cfg(test)]
 fn scan_file_content(
     path: &std::path::Path,
     content: &str,
@@ -357,8 +358,26 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
             continue;
         }
 
-        if let Ok(content) = fs::read_to_string(path) {
-            let findings = scan_file_content(path, &content, &patterns);
+        if let Ok(file) = fs::File::open(path) {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(file);
+            let mut findings = Vec::new();
+            let file_str = path.display().to_string();
+
+            for (line_num, line_result) in reader.lines().enumerate() {
+                if let Ok(line) = line_result {
+                    for pattern in &patterns {
+                        if pattern.regex.is_match(&line) {
+                            findings.push(ScanFinding {
+                                file: file_str.clone(),
+                                pattern: pattern.name.to_string(),
+                                line: line_num + 1,
+                            });
+                        }
+                    }
+                }
+            }
+
             if !findings.is_empty() && !json_output {
                 for f in &findings {
                     println!("{}:{}: {}", f.file, f.line, f.pattern);
@@ -368,46 +387,53 @@ fn cmd_scan(root: PathBuf, dry_run: bool, confirm: bool, json_output: bool) -> R
         }
     }
 
-    if json_output {
-        let json = serde_json::to_string_pretty(&all_findings)?;
-        println!("{}", json);
-        return Ok(());
-    }
-
     // Collect unique files with findings for deletion logic
-    let sensitive_files: Vec<PathBuf> = {
-        let mut seen = std::collections::HashSet::new();
-        all_findings
-            .iter()
-            .filter(|f| seen.insert(f.file.clone()))
-            .map(|f| PathBuf::from(&f.file))
-            .collect()
-    };
+    let sensitive_files: Vec<PathBuf> = all_findings
+        .iter()
+        .map(|f| &f.file)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
 
     if sensitive_files.is_empty() {
-        println!("No sensitive files found.");
+        if json_output {
+            println!("[]");
+        } else {
+            println!("No sensitive files found.");
+        }
         return Ok(());
     }
 
-    println!(
-        "\nFound {} findings in {} files:",
-        all_findings.len(),
-        sensitive_files.len()
-    );
-
-    if dry_run {
-        println!("\nDRY RUN: No files were deleted.");
-    } else if confirm {
-        println!("\nDeleting sensitive files...");
-        for file in sensitive_files {
-            if let Err(e) = fs::remove_file(&file) {
+    // Perform deletion before outputting results
+    if !dry_run && confirm {
+        if !json_output {
+            println!("\nDeleting sensitive files...");
+        }
+        for file in &sensitive_files {
+            if let Err(e) = fs::remove_file(file) {
                 eprintln!("Failed to delete {:?}: {}", file, e);
-            } else {
+            } else if !json_output {
                 println!("Deleted {:?}", file);
             }
         }
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&all_findings)?;
+        println!("{}", json);
     } else {
-        println!("\nRun with --confirm to delete these files.");
+        println!(
+            "\nFound {} findings in {} files:",
+            all_findings.len(),
+            sensitive_files.len()
+        );
+
+        if dry_run {
+            println!("\nDRY RUN: No files were deleted.");
+        } else if !confirm {
+            println!("\nRun with --confirm to delete these files.");
+        }
     }
 
     Ok(())
@@ -850,18 +876,49 @@ fn cmd_prune(
         let json = serde_json::to_string_pretty(&all_results)?;
         println!("{}", json);
     } else {
-        let total_deleted: usize = all_results.iter().map(|r| r.branches_deleted.len()).sum();
-        let total_scanned: usize = all_results.iter().map(|r| r.branches_scanned).sum();
-        println!(
-            "\nTotal: {} repos, {} branches scanned, {} {}",
-            all_results.len(),
-            total_scanned,
-            total_deleted,
-            if dry_run { "would delete" } else { "deleted" },
-        );
+        println!("\n{}", format_prune_summary(&all_results, dry_run));
     }
 
     Ok(())
+}
+
+/// Format a human-readable summary table from prune results.
+fn format_prune_summary(results: &[PruneResult], dry_run: bool) -> String {
+    let total_scanned: usize = results.iter().map(|r| r.branches_scanned).sum();
+    let total_deleted: usize = results.iter().map(|r| r.branches_deleted.len()).sum();
+    let total_protected: usize = results.iter().map(|r| r.branches_protected.len()).sum();
+    let total_open_prs: usize = results.iter().map(|r| r.branches_with_open_prs.len()).sum();
+    let total_recent: usize = results
+        .iter()
+        .map(|r| r.branches_skipped_recent.len())
+        .sum();
+    let total_errors: usize = results.iter().map(|r| r.errors.len()).sum();
+
+    let action = if dry_run { "Would delete" } else { "Deleted" };
+    let label = if dry_run {
+        "Summary (dry-run):"
+    } else {
+        "Summary:"
+    };
+
+    let action_label = format!("{}:", action);
+    let mut lines = vec![
+        label.to_string(),
+        format!("  {:<18} {}", "Repos scanned:", results.len()),
+        format!("  {:<18} {}", "Branches scanned:", total_scanned),
+        format!("  {:<18} {}", action_label, total_deleted),
+        format!("  {:<18} {}", "Protected:", total_protected),
+        format!("  {:<18} {}", "Open PRs:", total_open_prs),
+    ];
+
+    if total_recent > 0 {
+        lines.push(format!("  {:<18} {}", "Skipped (recent):", total_recent));
+    }
+    if total_errors > 0 {
+        lines.push(format!("  {:<18} {}", "Errors:", total_errors));
+    }
+
+    lines.join("\n")
 }
 
 // --- Main ---
@@ -1501,6 +1558,79 @@ mod tests {
         let findings: Vec<ScanFinding> = Vec::new();
         let json = serde_json::to_string(&findings).unwrap();
         assert_eq!(json, "[]");
+    }
+
+    // --- Tests for prune summary report (issue #16) ---
+
+    fn make_prune_result(
+        repo: &str,
+        scanned: usize,
+        deleted: usize,
+        protected: usize,
+        open_prs: usize,
+        recent: usize,
+        errors: usize,
+    ) -> PruneResult {
+        PruneResult {
+            repo: repo.to_string(),
+            branches_scanned: scanned,
+            branches_deleted: (0..deleted).map(|i| format!("del-{}", i)).collect(),
+            branches_protected: (0..protected).map(|i| format!("prot-{}", i)).collect(),
+            branches_with_open_prs: (0..open_prs).map(|i| format!("pr-{}", i)).collect(),
+            branches_skipped_recent: (0..recent).map(|i| format!("recent-{}", i)).collect(),
+            errors: (0..errors).map(|i| format!("err-{}", i)).collect(),
+        }
+    }
+
+    #[test]
+    fn test_format_prune_summary_dry_run() {
+        let results = vec![
+            make_prune_result("org/repo1", 50, 20, 10, 5, 15, 0),
+            make_prune_result("org/repo2", 30, 10, 8, 3, 9, 0),
+        ];
+        let summary = format_prune_summary(&results, true);
+        assert!(summary.contains("Summary (dry-run):"), "got:\n{}", summary);
+        assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
+        assert!(summary.contains("2"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Branches scanned:"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("80"), "got:\n{}", summary);
+        assert!(summary.contains("Would delete:"), "got:\n{}", summary);
+        assert!(summary.contains("30"), "got:\n{}", summary);
+        assert!(summary.contains("Protected:"), "got:\n{}", summary);
+        assert!(summary.contains("18"), "got:\n{}", summary);
+        assert!(summary.contains("Open PRs:"), "got:\n{}", summary);
+        assert!(summary.contains("Skipped (recent):"), "got:\n{}", summary);
+        assert!(summary.contains("24"), "got:\n{}", summary);
+        assert!(!summary.contains("Errors:"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_actual_run() {
+        let results = vec![make_prune_result("org/repo1", 20, 5, 10, 3, 0, 2)];
+        let summary = format_prune_summary(&results, false);
+        assert!(summary.contains("Summary:"), "got:\n{}", summary);
+        assert!(!summary.contains("dry-run"));
+        assert!(summary.contains("Deleted:"), "got:\n{}", summary);
+        assert!(summary.contains("5"), "got:\n{}", summary);
+        assert!(summary.contains("Errors:"), "got:\n{}", summary);
+        assert!(!summary.contains("Skipped (recent)"));
+    }
+
+    #[test]
+    fn test_format_prune_summary_empty_results() {
+        let results: Vec<PruneResult> = Vec::new();
+        let summary = format_prune_summary(&results, true);
+        assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
+        assert!(
+            summary.contains("Branches scanned:"),
+            "got:\n{}",
+            summary
+        );
+        assert!(summary.contains("Would delete:"), "got:\n{}", summary);
     }
 
     #[test]
