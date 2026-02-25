@@ -1770,11 +1770,7 @@ mod tests {
         assert!(summary.contains("Summary (dry-run):"), "got:\n{}", summary);
         assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
         assert!(summary.contains("2"), "got:\n{}", summary);
-        assert!(
-            summary.contains("Branches scanned:"),
-            "got:\n{}",
-            summary
-        );
+        assert!(summary.contains("Branches scanned:"), "got:\n{}", summary);
         assert!(summary.contains("80"), "got:\n{}", summary);
         assert!(summary.contains("Would delete:"), "got:\n{}", summary);
         assert!(summary.contains("30"), "got:\n{}", summary);
@@ -1803,11 +1799,7 @@ mod tests {
         let results: Vec<PruneResult> = Vec::new();
         let summary = format_prune_summary(&results, true);
         assert!(summary.contains("Repos scanned:"), "got:\n{}", summary);
-        assert!(
-            summary.contains("Branches scanned:"),
-            "got:\n{}",
-            summary
-        );
+        assert!(summary.contains("Branches scanned:"), "got:\n{}", summary);
         assert!(summary.contains("Would delete:"), "got:\n{}", summary);
     }
 
