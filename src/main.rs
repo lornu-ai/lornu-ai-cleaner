@@ -371,7 +371,6 @@ fn should_skip_scan_path(path: &std::path::Path) -> bool {
                 | "der"
                 | "p12"
                 | "pfx"
-                | "min.js"
                 | "map"
                 | "wasm"
                 | "png"
@@ -386,6 +385,14 @@ fn should_skip_scan_path(path: &std::path::Path) -> bool {
                 | "eot"
                 | "pdf"
         ) {
+            return true;
+        }
+    }
+
+    // Check for compound extensions like ".min.js" that Path::extension() can't match
+    // (Path::extension() returns "js" for "foo.min.js", not "min.js")
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with(".min.js") || name.ends_with(".min.css") {
             return true;
         }
     }
@@ -906,6 +913,11 @@ fn parse_iso8601_age_days(date_str: &str, now_epoch_secs: u64) -> Option<u64> {
         return None;
     }
     let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
+
+    // Validate date ranges to prevent panics in days_from_epoch
+    if month == 0 || month > 12 || day == 0 || day > 31 {
+        return None;
+    }
 
     // Strip timezone suffix: "Z", "+00:00", "-05:00", etc.
     let time_part = parts[1];
@@ -1716,6 +1728,50 @@ mod tests {
         assert!(!should_skip_scan_path(std::path::Path::new(
             "/repo/src/lib.rs"
         )));
+    }
+
+    #[test]
+    fn test_should_skip_minified_js_and_css() {
+        // Bug fix: Path::extension() returns "js" for "foo.min.js", not "min.js".
+        // The old code had "min.js" in the extension match which was dead code.
+        assert!(should_skip_scan_path(std::path::Path::new(
+            "/repo/dist/bundle.min.js"
+        )));
+        assert!(should_skip_scan_path(std::path::Path::new(
+            "/repo/dist/styles.min.css"
+        )));
+        // Regular .js and .css should NOT be skipped
+        assert!(!should_skip_scan_path(std::path::Path::new(
+            "/repo/src/app.js"
+        )));
+        assert!(!should_skip_scan_path(std::path::Path::new(
+            "/repo/src/styles.css"
+        )));
+    }
+
+    #[test]
+    fn test_parse_iso8601_invalid_month_zero() {
+        // Bug fix: month=0 or month>12 would panic on array out-of-bounds
+        assert_eq!(
+            parse_iso8601_age_days("2026-00-15T12:00:00Z", 1772020800),
+            None
+        );
+        assert_eq!(
+            parse_iso8601_age_days("2026-13-15T12:00:00Z", 1772020800),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_iso8601_invalid_day_zero() {
+        assert_eq!(
+            parse_iso8601_age_days("2026-06-00T12:00:00Z", 1772020800),
+            None
+        );
+        assert_eq!(
+            parse_iso8601_age_days("2026-06-32T12:00:00Z", 1772020800),
+            None
+        );
     }
 
     #[test]
